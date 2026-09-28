@@ -41,6 +41,8 @@ from app.parser import (
     COMPANION_EXTENSIONS,
     MEDIA_EXTENSIONS,
     companion_suffix,
+    classify_companion,
+    is_extra_video,
     parse_filename,
     parse_media_path,
     split_companion_filename,
@@ -252,7 +254,7 @@ def build_proposed_filename(
 
 
 def find_companion_files(video_path):
-    """Find sidecar files that belong to a video by matching its base stem."""
+    """Find subtitles, NFOs and artwork that safely belong to one video."""
     video = Path(video_path)
     companions = []
 
@@ -264,12 +266,14 @@ def find_companion_files(video_path):
     for candidate in video.parent.iterdir():
         if not candidate.is_file():
             continue
-
         if candidate.suffix.lower() not in COMPANION_EXTENSIONS:
             continue
 
         base_stem, _tags = split_companion_filename(candidate)
 
+        # Only attach sidecars whose base name identifies this exact video.
+        # Generic poster.jpg/fanart.jpg remains untouched so it cannot be
+        # accidentally assigned to one episode in a multi-episode folder.
         if base_stem.casefold() == video_stem:
             companions.append(candidate)
 
@@ -1094,11 +1098,12 @@ class RenameConfirmationDialog(QDialog):
         preview_lines = []
 
         for index, item in enumerate(plan, start=1):
-            label = (
-                "COMPANION"
-                if item.get("kind") == "companion"
-                else "VIDEO"
-            )
+            if item.get("kind") == "companion":
+                label = classify_companion(
+                    item["source"] if "source" in item else item.get("old", "")
+                ).upper().replace("-GLOBAL", "")
+            else:
+                label = "VIDEO"
             preview_lines.append(
                 f"{index}. [{label}]\n"
                 f"   FROM: {item['source']}\n"
@@ -1288,11 +1293,12 @@ class RenameHistoryDialog(QDialog):
             batch.get("items", []),
             start=1,
         ):
-            label = (
-                "COMPANION"
-                if item.get("kind") == "companion"
-                else "VIDEO"
-            )
+            if item.get("kind") == "companion":
+                label = classify_companion(
+                    item["source"] if "source" in item else item.get("old", "")
+                ).upper().replace("-GLOBAL", "")
+            else:
+                label = "VIDEO"
             lines.extend(
                 [
                     f"{index}. [{label}]",
@@ -2048,6 +2054,7 @@ class RogueRenamer(QMainWindow):
             if (
                 path.is_file()
                 and path.suffix.lower() in MEDIA_EXTENSIONS
+                and not is_extra_video(path)
             ):
                 self.add_file(str(path))
 
@@ -2068,6 +2075,9 @@ class RogueRenamer(QMainWindow):
             path.suffix.lower()
             not in MEDIA_EXTENSIONS
         ):
+            return
+
+        if is_extra_video(path):
             return
 
         parsed = parse_media_path(

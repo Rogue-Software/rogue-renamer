@@ -24,6 +24,10 @@ COMPANION_EXTENSIONS = {
     ".vtt",
     ".idx",
     ".nfo",
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
 }
 
 COMPANION_TAGS = {
@@ -67,6 +71,43 @@ def companion_suffix(filepath):
 
     tag_part = "".join(f".{tag}" for tag in tags)
     return f"{tag_part}{path.suffix.lower()}"
+
+
+ARTWORK_NAMES = {
+    "poster", "folder", "cover", "fanart", "backdrop", "background",
+    "banner", "clearlogo", "logo", "landscape", "thumb",
+}
+
+EXTRA_FOLDER_NAMES = {
+    "extras", "featurettes", "trailers", "interviews", "scenes",
+    "shorts", "behind the scenes", "deleted scenes",
+}
+
+
+def classify_companion(filepath):
+    """Classify a sidecar without changing its filename semantics."""
+    path = Path(filepath)
+    suffix = path.suffix.lower()
+    stem_lower = path.stem.casefold()
+
+    if suffix in {".srt", ".ass", ".ssa", ".sub", ".vtt", ".idx"}:
+        return "subtitle"
+    if suffix == ".nfo":
+        return "nfo"
+    if suffix in {".jpg", ".jpeg", ".png", ".webp"}:
+        if stem_lower in ARTWORK_NAMES:
+            return "artwork-global"
+        return "artwork"
+    return "companion"
+
+
+def is_extra_video(filepath):
+    """True for video files inside conventional extras/trailer folders."""
+    path = Path(filepath)
+    return any(
+        parent.name.casefold() in EXTRA_FOLDER_NAMES
+        for parent in path.parents
+    )
 
 
 JUNK_WORDS = {
