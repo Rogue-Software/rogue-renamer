@@ -5,6 +5,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDialog,
     QFileDialog,
     QFormLayout,
@@ -48,40 +49,135 @@ def safe_filename(text):
     return text.strip()
 
 
+DEFAULT_MOVIE_TEMPLATE = "{title} ({year})"
+DEFAULT_TV_TEMPLATE = "{title} - S{season:02d}E{episode:02d} - {episode_title}"
+
+DEFAULT_MOVIE_FOLDER_TEMPLATE = "{title} ({year})"
+DEFAULT_TV_FOLDER_TEMPLATE = "{title}/Season {season:02d}"
+
+
+def get_organization_settings():
+    config = load_config()
+    organization = config.get("organization", {})
+
+    return {
+        "enabled": bool(organization.get("enabled", False)),
+        "movie_folder_template": organization.get(
+            "movie_folder_template",
+            DEFAULT_MOVIE_FOLDER_TEMPLATE,
+        ),
+        "tv_folder_template": organization.get(
+            "tv_folder_template",
+            DEFAULT_TV_FOLDER_TEMPLATE,
+        ),
+    }
+
+
+def render_folder_template(template, values):
+    try:
+        rendered = template.format(**values)
+    except (KeyError, ValueError, IndexError) as error:
+        raise ValueError(
+            f"Invalid folder template: {error}"
+        ) from error
+
+    parts = []
+
+    for raw_part in rendered.replace("\\", "/").split("/"):
+        cleaned = safe_filename(" ".join(raw_part.split()))
+        cleaned = cleaned.strip(" .")
+
+        if cleaned:
+            parts.append(cleaned)
+
+    if not parts:
+        raise ValueError("Folder template produced an empty path.")
+
+    return Path(*parts)
+
+
+def build_destination_path(original_path, match, proposed_name):
+    source = Path(original_path)
+    organization = get_organization_settings()
+
+    if not organization["enabled"]:
+        return source.with_name(proposed_name)
+
+    if match["type"] == "Movie":
+        values = {
+            "title": match.get("title", ""),
+            "year": match.get("year") or "",
+            "tmdb_id": match.get("id") or "",
+        }
+        relative_folder = render_folder_template(
+            organization["movie_folder_template"],
+            values,
+        )
+    else:
+        values = {
+            "title": match.get("title", ""),
+            "year": match.get("year") or "",
+            "season": match.get("season") or 0,
+            "episode": match.get("episode") or 0,
+            "episode_title": match.get("episode_title") or "",
+            "tmdb_id": match.get("id") or "",
+        }
+        relative_folder = render_folder_template(
+            organization["tv_folder_template"],
+            values,
+        )
+
+    # Organize beneath the folder containing the selected source file.
+    return source.parent / relative_folder / proposed_name
+
+
+def get_naming_templates():
+    config = load_config()
+    naming = config.get("naming", {})
+    return (
+        naming.get("movie_template", DEFAULT_MOVIE_TEMPLATE),
+        naming.get("tv_template", DEFAULT_TV_TEMPLATE),
+    )
+
+
+def render_naming_template(template, values):
+    try:
+        filename = template.format(**values)
+    except (KeyError, ValueError, IndexError) as error:
+        raise ValueError(f"Invalid naming template: {error}") from error
+
+    filename = " ".join(filename.split())
+    filename = filename.strip(" -._")
+    return safe_filename(filename)
+
+
 def build_proposed_filename(
     original_path,
     match,
 ):
     path = Path(original_path)
     extension = path.suffix
+    movie_template, tv_template = get_naming_templates()
 
     if match["type"] == "Movie":
-        title = match["title"]
-        year = match.get("year")
-
-        if year:
-            filename = f"{title} ({year})"
-        else:
-            filename = title
-
+        values = {
+            "title": match.get("title", ""),
+            "year": match.get("year") or "",
+            "tmdb_id": match.get("id") or "",
+        }
+        filename = render_naming_template(movie_template, values)
     else:
-        season = match["season"]
-        episode = match["episode"]
+        values = {
+            "title": match.get("title", ""),
+            "year": match.get("year") or "",
+            "season": match.get("season") or 0,
+            "episode": match.get("episode") or 0,
+            "episode_title": match.get("episode_title") or "",
+            "tmdb_id": match.get("id") or "",
+        }
+        filename = render_naming_template(tv_template, values)
 
-        episode_title = match.get(
-            "episode_title",
-            "",
-        )
-
-        filename = (
-            f"{match['title']} - "
-            f"S{season:02d}E{episode:02d}"
-        )
-
-        if episode_title:
-            filename += f" - {episode_title}"
-
-    return safe_filename(filename) + extension
+    return filename + extension
 
 
 class SettingsDialog(QDialog):
@@ -92,7 +188,7 @@ class SettingsDialog(QDialog):
             "Rogue Renamer Settings"
         )
 
-        self.resize(600, 260)
+        self.resize(780, 650)
 
         self.config = load_config()
 
@@ -153,6 +249,95 @@ class SettingsDialog(QDialog):
         )
 
         layout.addLayout(form)
+
+        naming_title = QLabel("Naming Presets")
+        naming_title.setStyleSheet(
+            "font-size: 20px; font-weight: bold; margin-top: 12px;"
+        )
+        layout.addWidget(naming_title)
+
+        naming_help = QLabel(
+            "Movie fields: {title}, {year}, {tmdb_id}\n"
+            "TV fields: {title}, {year}, {season}, {episode}, "
+            "{episode_title}, {tmdb_id}\n"
+            "Formatting such as {season:02d} and {episode:02d} is supported."
+        )
+        naming_help.setWordWrap(True)
+        naming_help.setStyleSheet("color: #aaaaaa;")
+        layout.addWidget(naming_help)
+
+        naming = self.config.get("naming", {})
+
+        naming_form = QFormLayout()
+
+        self.movie_template_input = QLineEdit()
+        self.movie_template_input.setText(
+            naming.get("movie_template", DEFAULT_MOVIE_TEMPLATE)
+        )
+
+        self.tv_template_input = QLineEdit()
+        self.tv_template_input.setText(
+            naming.get("tv_template", DEFAULT_TV_TEMPLATE)
+        )
+
+        naming_form.addRow("Movie template:", self.movie_template_input)
+        naming_form.addRow("TV template:", self.tv_template_input)
+        layout.addLayout(naming_form)
+
+        organization_title = QLabel("Folder Organization")
+        organization_title.setStyleSheet(
+            "font-size: 20px; font-weight: bold; margin-top: 12px;"
+        )
+        layout.addWidget(organization_title)
+
+        organization = self.config.get("organization", {})
+
+        self.organize_checkbox = QCheckBox(
+            "Organize matched media into folders"
+        )
+        self.organize_checkbox.setChecked(
+            bool(organization.get("enabled", False))
+        )
+        layout.addWidget(self.organize_checkbox)
+
+        organization_help = QLabel(
+            "When enabled, Rogue Renamer moves files into folders beneath "
+            "their current location. Use / to create nested folders.\n"
+            "Movie fields: {title}, {year}, {tmdb_id}\n"
+            "TV fields: {title}, {year}, {season}, {episode}, "
+            "{episode_title}, {tmdb_id}"
+        )
+        organization_help.setWordWrap(True)
+        organization_help.setStyleSheet("color: #aaaaaa;")
+        layout.addWidget(organization_help)
+
+        organization_form = QFormLayout()
+
+        self.movie_folder_input = QLineEdit()
+        self.movie_folder_input.setText(
+            organization.get(
+                "movie_folder_template",
+                DEFAULT_MOVIE_FOLDER_TEMPLATE,
+            )
+        )
+
+        self.tv_folder_input = QLineEdit()
+        self.tv_folder_input.setText(
+            organization.get(
+                "tv_folder_template",
+                DEFAULT_TV_FOLDER_TEMPLATE,
+            )
+        )
+
+        organization_form.addRow(
+            "Movie folders:",
+            self.movie_folder_input,
+        )
+        organization_form.addRow(
+            "TV folders:",
+            self.tv_folder_input,
+        )
+        layout.addLayout(organization_form)
 
         self.connection_status = QLabel(
             "Connection not tested"
@@ -246,6 +431,91 @@ class SettingsDialog(QDialog):
                 self.api_key_input
                 .text()
                 .strip(),
+        }
+
+        movie_template = (
+            self.movie_template_input.text().strip()
+            or DEFAULT_MOVIE_TEMPLATE
+        )
+        tv_template = (
+            self.tv_template_input.text().strip()
+            or DEFAULT_TV_TEMPLATE
+        )
+
+        try:
+            render_naming_template(
+                movie_template,
+                {
+                    "title": "Example Movie",
+                    "year": 2026,
+                    "tmdb_id": 12345,
+                },
+            )
+            render_naming_template(
+                tv_template,
+                {
+                    "title": "Example Show",
+                    "year": 2026,
+                    "season": 2,
+                    "episode": 3,
+                    "episode_title": "Example Episode",
+                    "tmdb_id": 67890,
+                },
+            )
+        except ValueError as error:
+            QMessageBox.warning(
+                self,
+                "Invalid Naming Template",
+                str(error),
+            )
+            return
+
+        self.config["naming"] = {
+            "movie_template": movie_template,
+            "tv_template": tv_template,
+        }
+
+        movie_folder_template = (
+            self.movie_folder_input.text().strip()
+            or DEFAULT_MOVIE_FOLDER_TEMPLATE
+        )
+        tv_folder_template = (
+            self.tv_folder_input.text().strip()
+            or DEFAULT_TV_FOLDER_TEMPLATE
+        )
+
+        try:
+            render_folder_template(
+                movie_folder_template,
+                {
+                    "title": "Example Movie",
+                    "year": 2026,
+                    "tmdb_id": 12345,
+                },
+            )
+            render_folder_template(
+                tv_folder_template,
+                {
+                    "title": "Example Show",
+                    "year": 2026,
+                    "season": 2,
+                    "episode": 3,
+                    "episode_title": "Example Episode",
+                    "tmdb_id": 67890,
+                },
+            )
+        except ValueError as error:
+            QMessageBox.warning(
+                self,
+                "Invalid Folder Template",
+                str(error),
+            )
+            return
+
+        self.config["organization"] = {
+            "enabled": self.organize_checkbox.isChecked(),
+            "movie_folder_template": movie_folder_template,
+            "tv_folder_template": tv_folder_template,
         }
 
         save_config(self.config)
@@ -433,6 +703,84 @@ class MatchSelectionDialog(QDialog):
 
         self.selected_match = candidate
         self.accept()
+
+
+class RenameConfirmationDialog(QDialog):
+    def __init__(self, plan, parent=None):
+        super().__init__(parent)
+
+        self.setWindowTitle("Confirm Rename")
+        self.resize(900, 600)
+        self.setMinimumSize(650, 420)
+
+        layout = QVBoxLayout(self)
+
+        heading = QLabel(
+            f"Rename {len(plan)} file"
+            f"{'s' if len(plan) != 1 else ''}?"
+        )
+        heading.setStyleSheet(
+            "font-size: 20px; font-weight: bold;"
+        )
+        layout.addWidget(heading)
+
+        explanation = QLabel(
+            "Review the complete rename plan below. "
+            "No existing files will be overwritten."
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+
+        self.preview = QTextEdit()
+        self.preview.setReadOnly(True)
+        self.preview.setLineWrapMode(
+            QTextEdit.LineWrapMode.NoWrap
+        )
+        self.preview.setStyleSheet(
+            """
+            QTextEdit {
+                background: #1d2024;
+                color: #eeeeee;
+                border: 1px solid #444;
+                padding: 8px;
+            }
+            """
+        )
+
+        preview_lines = []
+
+        for index, item in enumerate(plan, start=1):
+            preview_lines.append(
+                f"{index}. {item['source']}\n"
+                f"   → {item['destination']}"
+            )
+
+        self.preview.setPlainText(
+            "\n\n".join(preview_lines)
+        )
+        layout.addWidget(self.preview, 1)
+
+        warning = QLabel(
+            "No existing files will be overwritten."
+        )
+        warning.setStyleSheet(
+            "color: #aaaaaa; font-weight: bold;"
+        )
+        layout.addWidget(warning)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(self.reject)
+
+        rename_button = QPushButton("Rename Files")
+        rename_button.clicked.connect(self.accept)
+        rename_button.setDefault(True)
+
+        buttons.addWidget(cancel_button)
+        buttons.addWidget(rename_button)
+        layout.addLayout(buttons)
 
 
 class RogueRenamer(QMainWindow):
@@ -749,7 +1097,35 @@ class RogueRenamer(QMainWindow):
             self.styleSheet()
         )
 
-        dialog.exec()
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.refresh_proposed_filenames()
+
+    def refresh_proposed_filenames(self):
+        for row in range(self.table.rowCount()):
+            match_item = self.table.item(row, 4)
+            original_item = self.table.item(row, 0)
+
+            if not match_item or not original_item:
+                continue
+
+            match = match_item.data(Qt.ItemDataRole.UserRole)
+            if not match:
+                continue
+
+            filepath = original_item.data(Qt.ItemDataRole.UserRole)
+
+            try:
+                proposed = build_proposed_filename(filepath, match)
+            except ValueError:
+                continue
+
+            self.table.setItem(
+                row,
+                6,
+                QTableWidgetItem(proposed),
+            )
+
+        self.update_rename_state()
 
     def select_folder(self):
         folder = (
@@ -1005,12 +1381,20 @@ class RogueRenamer(QMainWindow):
                     ),
                 )
 
-                proposed = (
-                    build_proposed_filename(
-                        filepath,
-                        match,
+                try:
+                    proposed = (
+                        build_proposed_filename(
+                            filepath,
+                            match,
+                        )
                     )
-                )
+                except ValueError as error:
+                    self.table.setItem(
+                        row,
+                        7,
+                        QTableWidgetItem(f"Error: {error}"),
+                    )
+                    continue
 
                 self.table.setItem(
                     row,
@@ -1164,10 +1548,18 @@ class RogueRenamer(QMainWindow):
             ),
         )
 
-        proposed = build_proposed_filename(
-            filepath,
-            match,
-        )
+        try:
+            proposed = build_proposed_filename(
+                filepath,
+                match,
+            )
+        except ValueError as error:
+            QMessageBox.warning(
+                self,
+                "Invalid Naming Template",
+                str(error),
+            )
+            return
 
         self.table.setItem(
             row,
@@ -1239,8 +1631,9 @@ class RogueRenamer(QMainWindow):
         for row in range(self.table.rowCount()):
             original_item = self.table.item(row, 0)
             proposed_item = self.table.item(row, 6)
+            match_item = self.table.item(row, 4)
 
-            if not original_item or not proposed_item:
+            if not original_item or not proposed_item or not match_item:
                 errors.append(
                     f"Row {row + 1}: missing rename information."
                 )
@@ -1252,23 +1645,34 @@ class RogueRenamer(QMainWindow):
                 )
             )
             proposed_name = proposed_item.text().strip()
+            match = match_item.data(
+                Qt.ItemDataRole.UserRole
+            )
 
-            if not proposed_name:
+            if not proposed_name or not match:
                 errors.append(
-                    f"{source.name}: no proposed filename."
+                    f"{source.name}: missing proposed filename or match."
                 )
                 continue
 
-            destination = source.with_name(
-                proposed_name
-            )
+            try:
+                destination = build_destination_path(
+                    source,
+                    match,
+                    proposed_name,
+                )
+            except ValueError as error:
+                errors.append(
+                    f"{source.name}: {error}"
+                )
+                continue
 
-            source_key = str(source).casefold()
-            destination_key = str(destination).casefold()
+            source_key = str(source.resolve()).casefold()
+            destination_key = str(destination.absolute()).casefold()
 
             if destination_key in destinations:
                 errors.append(
-                    f"Duplicate destination: {destination.name}"
+                    f"Duplicate destination: {destination}"
                 )
                 continue
 
@@ -1280,11 +1684,9 @@ class RogueRenamer(QMainWindow):
                 )
                 continue
 
-            # Same filename/path means there is nothing to do.
             if source_key == destination_key:
                 continue
 
-            # Never overwrite another existing file.
             if destination.exists():
                 errors.append(
                     f"Destination already exists: {destination}"
@@ -1327,31 +1729,18 @@ class RogueRenamer(QMainWindow):
             )
             return
 
-        preview_lines = []
-
-        for item in plan[:15]:
-            preview_lines.append(
-                f"{item['source'].name}\n"
-                f"  → {item['destination'].name}"
-            )
-
-        if len(plan) > 15:
-            preview_lines.append(
-                f"...and {len(plan) - 15} more file(s)."
-            )
-
-        answer = QMessageBox.question(
+        confirm_dialog = RenameConfirmationDialog(
+            plan,
             self,
-            "Confirm Rename",
-            f"Rename {len(plan)} file(s)?\n\n"
-            + "\n\n".join(preview_lines)
-            + "\n\nNo existing files will be overwritten.",
-            QMessageBox.StandardButton.Yes
-            | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
+        )
+        confirm_dialog.setStyleSheet(
+            self.styleSheet()
         )
 
-        if answer != QMessageBox.StandardButton.Yes:
+        if (
+            confirm_dialog.exec()
+            != QDialog.DialogCode.Accepted
+        ):
             return
 
         completed = []
@@ -1368,6 +1757,18 @@ class RogueRenamer(QMainWindow):
                         f"{destination}"
                     )
 
+                created_directories = []
+                parent = destination.parent
+
+                missing = []
+                cursor = parent
+                while not cursor.exists():
+                    missing.append(cursor)
+                    cursor = cursor.parent
+
+                parent.mkdir(parents=True, exist_ok=True)
+                created_directories.extend(missing)
+
                 source.rename(destination)
 
                 completed.append(
@@ -1375,6 +1776,7 @@ class RogueRenamer(QMainWindow):
                         "row": item["row"],
                         "old": source,
                         "new": destination,
+                        "created_directories": created_directories,
                     }
                 )
 
@@ -1391,6 +1793,15 @@ class RogueRenamer(QMainWindow):
                         item["new"].rename(
                             item["old"]
                         )
+
+                    for directory in item.get(
+                        "created_directories",
+                        [],
+                    ):
+                        try:
+                            directory.rmdir()
+                        except OSError:
+                            pass
                 except Exception as rollback_error:
                     rollback_errors.append(
                         str(rollback_error)
@@ -1517,6 +1928,16 @@ class RogueRenamer(QMainWindow):
                 item["new"].rename(
                     item["old"]
                 )
+
+                for directory in item.get(
+                    "created_directories",
+                    [],
+                ):
+                    try:
+                        directory.rmdir()
+                    except OSError:
+                        pass
+
                 undone.append(item)
 
         except Exception as error:

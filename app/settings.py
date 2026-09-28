@@ -6,6 +6,22 @@ from pathlib import Path
 
 APP_NAME = "RogueRenamer"
 
+DEFAULT_CONFIG = {
+    "tmdb": {
+        "access_token": "",
+        "api_key": "",
+    },
+    "naming": {
+        "movie_template": "{title} ({year})",
+        "tv_template": "{title} - S{season:02d}E{episode:02d} - {episode_title}",
+    },
+    "organization": {
+        "enabled": False,
+        "movie_folder_template": "{title} ({year})",
+        "tv_folder_template": "{title}/Season {season:02d}",
+    },
+}
+
 
 def get_config_dir():
     system = platform.system()
@@ -18,7 +34,6 @@ def get_config_dir():
 
         return Path.home() / "AppData" / "Roaming" / APP_NAME
 
-    # Linux / other Unix-like systems
     xdg_config = os.getenv("XDG_CONFIG_HOME")
 
     if xdg_config:
@@ -32,16 +47,34 @@ def get_config_file():
 
 
 def load_config():
+    config = {
+        "tmdb": DEFAULT_CONFIG["tmdb"].copy(),
+        "naming": DEFAULT_CONFIG["naming"].copy(),
+        "organization": DEFAULT_CONFIG["organization"].copy(),
+    }
+
     config_file = get_config_file()
 
     if not config_file.exists():
-        return {}
+        return config
 
     try:
         with open(config_file, "r", encoding="utf-8") as file:
-            return json.load(file)
-    except (OSError, json.JSONDecodeError):
-        return {}
+            saved = json.load(file)
+
+        if isinstance(saved.get("tmdb"), dict):
+            config["tmdb"].update(saved["tmdb"])
+
+        if isinstance(saved.get("naming"), dict):
+            config["naming"].update(saved["naming"])
+
+        if isinstance(saved.get("organization"), dict):
+            config["organization"].update(saved["organization"])
+
+        return config
+
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return config
 
 
 def save_config(config):
