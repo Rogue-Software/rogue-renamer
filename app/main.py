@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QFrame,
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSpinBox,
+    QScrollBar,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -1371,44 +1373,56 @@ class RogueRenamer(QMainWindow):
             ]
         )
 
-        self.table.setColumnWidth(
+        # Responsive table layout. Fixed-width utility columns stay compact,
+        # while text-heavy columns share whatever width the window provides.
+        header_view = self.table.horizontalHeader()
+
+        header_view.setSectionResizeMode(
             0,
-            300,
+            QHeaderView.ResizeMode.Stretch,
         )
-
-        self.table.setColumnWidth(
+        header_view.setSectionResizeMode(
             1,
-            75,
+            QHeaderView.ResizeMode.Fixed,
         )
-
-        self.table.setColumnWidth(
+        header_view.setSectionResizeMode(
             2,
-            190,
+            QHeaderView.ResizeMode.Stretch,
         )
-
-        self.table.setColumnWidth(
+        header_view.setSectionResizeMode(
             3,
-            80,
+            QHeaderView.ResizeMode.Fixed,
         )
-
-        self.table.setColumnWidth(
+        header_view.setSectionResizeMode(
             4,
-            190,
+            QHeaderView.ResizeMode.Stretch,
         )
-
-        self.table.setColumnWidth(
+        header_view.setSectionResizeMode(
             5,
-            200,
+            QHeaderView.ResizeMode.Stretch,
         )
-
-        self.table.setColumnWidth(
+        header_view.setSectionResizeMode(
             6,
-            360,
+            QHeaderView.ResizeMode.Stretch,
+        )
+        header_view.setSectionResizeMode(
+            7,
+            QHeaderView.ResizeMode.Stretch,
         )
 
-        self.table.horizontalHeader().setStretchLastSection(
-            True
+        self.table.setColumnWidth(1, 72)
+        self.table.setColumnWidth(3, 82)
+
+        # Keep the table usable at unusually small window sizes too.
+        self.table.setHorizontalScrollMode(
+            QTableWidget.ScrollMode.ScrollPerPixel
         )
+        self.table.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+
+        header_view.setMinimumSectionSize(55)
+        header_view.setStretchLastSection(False)
 
         self.table.cellDoubleClicked.connect(
             self.review_match
@@ -1457,6 +1471,13 @@ class RogueRenamer(QMainWindow):
             self.rename_files
         )
 
+        for button in (
+            self.search_button,
+            self.review_button,
+            self.rename_button,
+        ):
+            button.setMinimumWidth(0)
+
         self.undo_button = QPushButton(
             "Undo Last Rename"
         )
@@ -1466,6 +1487,8 @@ class RogueRenamer(QMainWindow):
         self.undo_button.clicked.connect(
             self.undo_last_rename
         )
+
+        self.undo_button.setMinimumWidth(0)
 
         footer.addWidget(
             self.status_label
@@ -1856,10 +1879,12 @@ class RogueRenamer(QMainWindow):
             except ValueError:
                 continue
 
+            proposed_item = QTableWidgetItem(proposed)
+            proposed_item.setToolTip(proposed)
             self.table.setItem(
                 row,
                 6,
-                QTableWidgetItem(proposed),
+                proposed_item,
             )
 
         self.update_rename_state()
