@@ -9,6 +9,7 @@ from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QDialog,
     QFileDialog,
     QFormLayout,
@@ -1324,6 +1325,375 @@ class RenameHistoryDialog(QDialog):
         self.accept()
 
 
+def audit_library(root_path):
+    """Read-only structural audit. Never renames, moves, creates, or deletes files."""
+    root = Path(root_path)
+    findings = []
+    media_records = []
+    media_by_directory = {}
+    companion_files = []
+
+    def add(severity, category, path, message):
+        findings.append({
+            "severity": severity,
+            "category": category,
+            "path": str(path),
+            "message": message,
+        })
+
+    if not root.exists() or not root.is_dir():
+        return [{
+            "severity": "Problem",
+            "category": "Library",
+            "path": str(root),
+            "message": "Selected library folder does not exist.",
+        }]
+
+    try:
+        paths = sorted(
+            (p for p in root.rglob("*") if p.is_file()),
+            key=lambda p: str(p).casefold(),
+        )
+    except OSError as error:
+        return [{
+            "severity": "Problem",
+            "category": "Library",
+            "path": str(root),
+            "message": f"Could not scan library: {error}",
+        }]
+
+    for path in paths:
+        suffix = path.suffix.lower()
+
+        if suffix in MEDIA_EXTENSIONS:
+            if is_extra_video(path):
+                add(
+                    "OK",
+                    "Extra",
+                    path,
+                    "Recognized as an extra/trailer and excluded from primary-media checks.",
+                )
+                continue
+
+            parsed = parse_media_path(str(path))
+            record = {"path": path, "parsed": parsed}
+            media_records.append(record)
+            media_by_directory.setdefault(path.parent, []).append(record)
+
+            if parsed.get("type") == "Unknown":
+                add(
+                    "Problem",
+                    "Unparseable Media",
+                    path,
+                    "Could not confidently identify this filename as a movie or TV episode.",
+                )
+                continue
+
+            if parsed.get("type") == "TV":
+                folder_season = parsed.get("folder_season")
+                season = parsed.get("season")
+                if folder_season is not None and season is not None and folder_season != season:
+                    add(
+                        "Problem",
+                        "Season Conflict",
+                        path,
+                        f"Filename says Season {season:02d}, but the containing season folder says Season {folder_season:02d}.",
+                    )
+
+                folder_title = (parsed.get("folder_title") or "").strip()
+                parsed_title = (parsed.get("title") or "").strip()
+
+                # Generic library/container folders are not show titles.
+                generic_library_folders = {
+                    "tv", "tv show", "tv shows", "shows", "series",
+                    "television", "media", "video", "videos",
+                    "movie", "movies", "film", "films",
+                }
+                folder_title_is_generic = (
+                    folder_title.casefold() in generic_library_folders
+                    or (
+                        folder_title
+                        and Path(folder_title).name.casefold()
+                        in generic_library_folders
+                    )
+                )
+
+                if (
+                    folder_title
+                    and parsed_title
+                    and not folder_title_is_generic
+                    and folder_title.casefold() != parsed_title.casefold()
+                ):
+                    add(
+                        "Warning",
+                        "Title Conflict",
+                        path,
+                        f'Filename title "{parsed_title}" differs from folder title "{folder_title}".',
+                    )
+
+                if folder_season is None:
+                    add(
+                        "Warning",
+                        "TV Structure",
+                        path,
+                        "TV episode is not inside a recognized Season/Series folder.",
+                    )
+
+            elif parsed.get("type") == "Movie":
+                if not parsed.get("year"):
+                    add(
+                        "Warning",
+                        "Movie Naming",
+                        path,
+                        "Movie was parsed without a year; matching may be ambiguous.",
+                    )
+
+        elif suffix in COMPANION_EXTENSIONS:
+            companion_files.append(path)
+
+    # Duplicate TV episode detection, including multi-episode files.
+    episode_index = {}
+    for record in media_records:
+        parsed = record["parsed"]
+        if parsed.get("type") != "TV":
+            continue
+        title = (parsed.get("title") or "").casefold()
+        season = parsed.get("season")
+        for episode in parsed.get("episodes") or [parsed.get("episode")]:
+            if season is None or episode is None:
+                continue
+            key = (title, season, episode)
+            episode_index.setdefault(key, []).append(record["path"])
+
+    for (title, season, episode), paths_for_episode in episode_index.items():
+        if len(paths_for_episode) > 1:
+            names = ", ".join(p.name for p in paths_for_episode)
+            for path in paths_for_episode:
+                add(
+                    "Problem",
+                    "Duplicate Episode",
+                    path,
+                    f"S{season:02d}E{episode:02d} appears in multiple primary video files: {names}",
+                )
+
+    # Sidecars are considered attached when their parsed base stem matches a
+    # primary video stem in the same directory. Generic artwork is folder-level.
+    for companion in companion_files:
+        kind = classify_companion(companion)
+        if kind == "artwork-global":
+            add(
+                "OK",
+                "Folder Artwork",
+                companion,
+                "Recognized as generic folder/show artwork.",
+            )
+            continue
+
+        base_stem, _tags = split_companion_filename(companion)
+        directory_videos = media_by_directory.get(companion.parent, [])
+        attached = any(
+            record["path"].stem.casefold() == base_stem.casefold()
+            for record in directory_videos
+        )
+
+        if not attached:
+            add(
+                "Warning",
+                "Orphaned Sidecar",
+                companion,
+                f"{kind.replace('-', ' ').title()} does not match a primary video in the same folder.",
+            )
+
+    # Files with no finding are healthy primary media.
+    paths_with_findings = {
+        item["path"]
+        for item in findings
+        if item["severity"] in {"Warning", "Problem"}
+    }
+    for record in media_records:
+        path = record["path"]
+        if str(path) not in paths_with_findings:
+            parsed = record["parsed"]
+            if parsed.get("type") == "TV":
+                code = format_episode_code(parsed)
+                detail = f"Parsed successfully as {parsed.get('title', 'TV')} {code}."
+            else:
+                year = parsed.get("year") or "unknown year"
+                detail = f"Parsed successfully as {parsed.get('title', 'Movie')} ({year})."
+            add("OK", "Media", path, detail)
+
+    severity_order = {"Problem": 0, "Warning": 1, "OK": 2}
+    findings.sort(
+        key=lambda item: (
+            severity_order.get(item["severity"], 9),
+            item["category"].casefold(),
+            item["path"].casefold(),
+        )
+    )
+    return findings
+
+
+class LibraryAuditDialog(QDialog):
+    def __init__(self, root_path, findings, parent=None):
+        super().__init__(parent)
+        self.root_path = str(root_path)
+        self.findings = findings
+
+        self.setWindowTitle("Rogue Renamer — Library Audit")
+        self.resize(1180, 720)
+        self.setMinimumSize(820, 520)
+
+        layout = QVBoxLayout(self)
+
+        heading = QLabel("LIBRARY AUDIT")
+        heading.setStyleSheet("font-size: 22px; font-weight: bold;")
+        layout.addWidget(heading)
+
+        root_label = QLabel(f"Read-only scan: {self.root_path}")
+        root_label.setWordWrap(True)
+        root_label.setStyleSheet("color: #aaaaaa;")
+        layout.addWidget(root_label)
+
+        summary = QHBoxLayout()
+        self.summary_label = QLabel()
+        self.summary_label.setStyleSheet("font-weight: bold;")
+        summary.addWidget(self.summary_label)
+        summary.addStretch()
+
+        summary.addWidget(QLabel("Show:"))
+        self.filter_combo = QComboBox()
+        self.filter_combo.addItems(["All", "Problems", "Warnings", "OK"])
+        self.filter_combo.currentTextChanged.connect(self.populate)
+        summary.addWidget(self.filter_combo)
+        layout.addLayout(summary)
+
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(
+            ["Status", "Category", "File", "Finding"]
+        )
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setAlternatingRowColors(True)
+
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.table.setColumnWidth(0, 90)
+
+        layout.addWidget(self.table, 1)
+
+        details_heading = QLabel("Finding Details")
+        details_heading.setStyleSheet("font-weight: bold; margin-top: 6px;")
+        layout.addWidget(details_heading)
+
+        self.details = QTextEdit()
+        self.details.setReadOnly(True)
+        self.details.setMinimumHeight(125)
+        self.details.setMaximumHeight(190)
+        self.details.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self.details.setStyleSheet("""
+            QTextEdit {
+                background: #1d2024;
+                color: #eeeeee;
+                border: 1px solid #444;
+                padding: 8px;
+            }
+        """)
+        self.details.setPlaceholderText(
+            "Select a finding above to see its full path and explanation."
+        )
+        layout.addWidget(self.details)
+
+        self.table.itemSelectionChanged.connect(self.update_details)
+
+        note = QLabel(
+            "Audit Mode is read-only. It does not rename, move, create, or delete files."
+        )
+        note.setStyleSheet("color: #aaaaaa;")
+        layout.addWidget(note)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.accept)
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+
+        self.populate()
+
+    def populate(self):
+        selected = self.filter_combo.currentText()
+        wanted = {
+            "Problems": "Problem",
+            "Warnings": "Warning",
+            "OK": "OK",
+        }.get(selected)
+
+        rows = [
+            finding
+            for finding in self.findings
+            if wanted is None or finding["severity"] == wanted
+        ]
+
+        problems = sum(f["severity"] == "Problem" for f in self.findings)
+        warnings = sum(f["severity"] == "Warning" for f in self.findings)
+        ok_count = sum(f["severity"] == "OK" for f in self.findings)
+        self.summary_label.setText(
+            f"{problems} Problems   •   {warnings} Warnings   •   {ok_count} OK"
+        )
+
+        self.table.setRowCount(0)
+        icons = {"Problem": "✖", "Warning": "⚠", "OK": "✓"}
+
+        for finding in rows:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            values = [
+                f"{icons.get(finding['severity'], '')} {finding['severity']}",
+                finding["category"],
+                finding["path"],
+                finding["message"],
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setToolTip(str(value))
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, finding)
+                self.table.setItem(row, column, item)
+
+        if self.table.rowCount():
+            self.table.selectRow(0)
+        else:
+            self.details.clear()
+
+    def update_details(self):
+        selected_rows = self.table.selectionModel().selectedRows()
+        if not selected_rows:
+            self.details.clear()
+            return
+
+        row = selected_rows[0].row()
+        item = self.table.item(row, 0)
+        if item is None:
+            self.details.clear()
+            return
+
+        finding = item.data(Qt.ItemDataRole.UserRole)
+        if not finding:
+            self.details.clear()
+            return
+
+        self.details.setPlainText(
+            f"Status: {finding['severity']}\n"
+            f"Category: {finding['category']}\n"
+            f"File: {finding['path']}\n\n"
+            f"{finding['message']}"
+        )
+
+
+
 class RogueRenamer(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1448,6 +1818,13 @@ class RogueRenamer(QMainWindow):
         controls.addWidget(
             self.scan_subfolders_checkbox
         )
+
+        audit_button = QPushButton("Audit Library")
+        audit_button.setToolTip(
+            "Scan an existing Movies or TV library for structural problems without changing files."
+        )
+        audit_button.clicked.connect(self.open_library_audit)
+        controls.addWidget(audit_button)
 
         controls.addStretch()
 
@@ -1967,6 +2344,24 @@ class RogueRenamer(QMainWindow):
             "Undo Complete",
             "The original filenames have been restored.",
         )
+
+
+    def open_library_audit(self):
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select Library to Audit",
+        )
+        if not folder:
+            return
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            findings = audit_library(folder)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        dialog = LibraryAuditDialog(folder, findings, self)
+        dialog.exec()
 
     def open_settings(self):
         dialog = SettingsDialog(
