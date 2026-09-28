@@ -31,8 +31,11 @@ from app.metadata.tmdb import (
     match_media,
 )
 from app.parser import (
+    COMPANION_EXTENSIONS,
     MEDIA_EXTENSIONS,
+    companion_suffix,
     parse_filename,
+    split_companion_filename,
 )
 from app.settings import (
     load_config,
@@ -178,6 +181,42 @@ def build_proposed_filename(
         filename = render_naming_template(tv_template, values)
 
     return filename + extension
+
+
+def find_companion_files(video_path):
+    """Find sidecar files that belong to a video by matching its base stem."""
+    video = Path(video_path)
+    companions = []
+
+    if not video.parent.exists():
+        return companions
+
+    video_stem = video.stem.casefold()
+
+    for candidate in video.parent.iterdir():
+        if not candidate.is_file():
+            continue
+
+        if candidate.suffix.lower() not in COMPANION_EXTENSIONS:
+            continue
+
+        base_stem, _tags = split_companion_filename(candidate)
+
+        if base_stem.casefold() == video_stem:
+            companions.append(candidate)
+
+    return sorted(
+        companions,
+        key=lambda item: item.name.casefold(),
+    )
+
+
+def build_companion_destination(video_destination, companion_path):
+    """Rename a sidecar to the renamed video's stem while preserving tags."""
+    return video_destination.with_name(
+        video_destination.stem
+        + companion_suffix(companion_path)
+    )
 
 
 class SettingsDialog(QDialog):
@@ -750,8 +789,13 @@ class RenameConfirmationDialog(QDialog):
         preview_lines = []
 
         for index, item in enumerate(plan, start=1):
+            label = (
+                "COMPANION"
+                if item.get("kind") == "companion"
+                else "VIDEO"
+            )
             preview_lines.append(
-                f"{index}. {item['source']}\n"
+                f"{index}. [{label}] {item['source']}\n"
                 f"   → {item['destination']}"
             )
 
@@ -1623,7 +1667,7 @@ class RogueRenamer(QMainWindow):
         self.rename_button.setEnabled(True)
 
     def build_rename_plan(self):
-        """Validate all destinations before changing any files."""
+        """Validate video and companion destinations before changing files."""
         plan = []
         destinations = set()
         errors = []
@@ -1667,39 +1711,64 @@ class RogueRenamer(QMainWindow):
                 )
                 continue
 
-            source_key = str(source.resolve()).casefold()
-            destination_key = str(destination.absolute()).casefold()
-
-            if destination_key in destinations:
-                errors.append(
-                    f"Duplicate destination: {destination}"
-                )
-                continue
-
-            destinations.add(destination_key)
-
-            if not source.exists():
-                errors.append(
-                    f"Source file is missing: {source}"
-                )
-                continue
-
-            if source_key == destination_key:
-                continue
-
-            if destination.exists():
-                errors.append(
-                    f"Destination already exists: {destination}"
-                )
-                continue
-
-            plan.append(
+            batch_items = [
                 {
                     "row": row,
                     "source": source,
                     "destination": destination,
+                    "kind": "video",
                 }
-            )
+            ]
+
+            for companion in find_companion_files(source):
+                companion_destination = build_companion_destination(
+                    destination,
+                    companion,
+                )
+                batch_items.append(
+                    {
+                        "row": row,
+                        "source": companion,
+                        "destination": companion_destination,
+                        "kind": "companion",
+                    }
+                )
+
+            for item in batch_items:
+                item_source = item["source"]
+                item_destination = item["destination"]
+
+                source_key = str(
+                    item_source.absolute()
+                ).casefold()
+                destination_key = str(
+                    item_destination.absolute()
+                ).casefold()
+
+                if destination_key in destinations:
+                    errors.append(
+                        f"Duplicate destination: {item_destination}"
+                    )
+                    continue
+
+                destinations.add(destination_key)
+
+                if not item_source.exists():
+                    errors.append(
+                        f"Source file is missing: {item_source}"
+                    )
+                    continue
+
+                if source_key == destination_key:
+                    continue
+
+                if item_destination.exists():
+                    errors.append(
+                        f"Destination already exists: {item_destination}"
+                    )
+                    continue
+
+                plan.append(item)
 
         return plan, errors
 
@@ -1776,6 +1845,7 @@ class RogueRenamer(QMainWindow):
                         "row": item["row"],
                         "old": source,
                         "new": destination,
+                        "kind": item.get("kind", "video"),
                         "created_directories": created_directories,
                     }
                 )
@@ -1830,8 +1900,12 @@ class RogueRenamer(QMainWindow):
             bool(completed)
         )
 
-        # Update each row to the new on-disk path.
+        # Update table rows for videos. Companion files are managed
+        # alongside their video but do not occupy separate table rows.
         for item in completed:
+            if item.get("kind") != "video":
+                continue
+
             row = item["row"]
             new_path = item["new"]
 
@@ -1847,12 +1921,24 @@ class RogueRenamer(QMainWindow):
                 str(new_path),
             )
 
+            companion_count = sum(
+                1
+                for entry in completed
+                if entry.get("row") == row
+                and entry.get("kind") == "companion"
+            )
+
+            status = "✓ Renamed"
+            if companion_count:
+                status += (
+                    f" + {companion_count} companion"
+                    f"{'s' if companion_count != 1 else ''}"
+                )
+
             self.table.setItem(
                 row,
                 7,
-                QTableWidgetItem(
-                    "✓ Renamed"
-                ),
+                QTableWidgetItem(status),
             )
 
         self.loaded_files = {
@@ -1977,6 +2063,9 @@ class RogueRenamer(QMainWindow):
             return
 
         for item in self.last_rename_batch:
+            if item.get("kind") != "video":
+                continue
+
             row = item["row"]
             old_path = item["old"]
 

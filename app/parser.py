@@ -16,6 +16,59 @@ MEDIA_EXTENSIONS = {
 }
 
 
+COMPANION_EXTENSIONS = {
+    ".srt",
+    ".ass",
+    ".ssa",
+    ".sub",
+    ".vtt",
+    ".idx",
+    ".nfo",
+}
+
+COMPANION_TAGS = {
+    "forced",
+    "sdh",
+    "cc",
+    "hi",
+    "default",
+    "commentary",
+}
+
+
+def split_companion_filename(filepath):
+    """Return the likely video stem and suffix tags for a companion file."""
+    path = Path(filepath)
+    stem = path.stem
+    parts = stem.split(".")
+
+    tags = []
+
+    # Preserve common language codes and subtitle flags at the end.
+    while len(parts) > 1:
+        candidate = parts[-1].lower()
+
+        is_language = bool(
+            re.fullmatch(r"[a-z]{2,3}(?:-[a-z]{2})?", candidate)
+        )
+
+        if candidate in COMPANION_TAGS or is_language:
+            tags.insert(0, parts.pop())
+        else:
+            break
+
+    return ".".join(parts), tags
+
+
+def companion_suffix(filepath):
+    """Return suffix such as '.en.forced.srt'."""
+    path = Path(filepath)
+    _, tags = split_companion_filename(filepath)
+
+    tag_part = "".join(f".{tag}" for tag in tags)
+    return f"{tag_part}{path.suffix.lower()}"
+
+
 JUNK_WORDS = {
     "1080p",
     "2160p",
