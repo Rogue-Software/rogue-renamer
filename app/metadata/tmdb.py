@@ -107,107 +107,159 @@ def confidence_label(score):
     return "Low"
 
 
-def score_movie_candidate(
-    parsed,
-    result,
-):
-    parsed_title = parsed["title"]
+def add_reason(reasons, points, text):
+    if points == 0:
+        return
+    sign = "+" if points > 0 else ""
+    reasons.append(f"{text} {sign}{points}")
 
-    tmdb_title = result.get(
-        "title",
-        "",
-    )
 
-    original_title = result.get(
-        "original_title",
-        "",
-    )
-
+def score_title(parsed_title, tmdb_title, original_title):
     similarity = max(
-        title_similarity(
-            parsed_title,
-            tmdb_title,
-        ),
-        title_similarity(
-            parsed_title,
-            original_title,
-        ),
+        title_similarity(parsed_title, tmdb_title),
+        title_similarity(parsed_title, original_title),
     )
 
-    # Title contributes up to 75 points.
-    score = similarity * 75
+    reasons = []
 
-    parsed_year = parsed.get("year")
+    if similarity >= 0.995:
+        points = 45
+        add_reason(reasons, points, "Exact title")
+    elif similarity >= 0.90:
+        points = 40
+        add_reason(reasons, points, "Very close title")
+    elif similarity >= 0.80:
+        points = 34
+        add_reason(reasons, points, "Close title")
+    elif similarity >= 0.65:
+        points = 25
+        add_reason(reasons, points, "Partial title")
+    else:
+        points = round(similarity * 30)
+        add_reason(reasons, points, "Weak title")
 
-    result_year = year_from_date(
-        result.get("release_date")
-    )
-
-    # A known year is extremely useful
-    # for distinguishing remakes.
-    if parsed_year and result_year:
-        if parsed_year == result_year:
-            score += 25
-
-        elif abs(parsed_year - result_year) == 1:
-            score += 10
-
-        else:
-            score -= 20
-
-    return max(
-        0,
-        min(100, round(score)),
-    )
+    return points, reasons, similarity
 
 
-def score_tv_candidate(
-    parsed,
-    result,
-):
-    parsed_title = parsed["title"]
+def score_year(parsed_year, result_year):
+    reasons = []
 
-    tmdb_title = result.get(
-        "name",
-        "",
-    )
+    if not parsed_year:
+        return 0, reasons
 
-    original_title = result.get(
-        "original_name",
-        "",
-    )
+    if not result_year:
+        add_reason(reasons, -4, "Filename year but TMDB year unknown")
+        return -4, reasons
 
-    similarity = max(
-        title_similarity(
-            parsed_title,
-            tmdb_title,
-        ),
-        title_similarity(
-            parsed_title,
-            original_title,
-        ),
-    )
+    difference = abs(parsed_year - result_year)
 
-    # We don't normally have a year
-    # in SxxExx filenames, so title
-    # similarity carries most weight.
-    score = similarity * 90
+    if difference == 0:
+        add_reason(reasons, 30, "Exact year")
+        return 30, reasons
 
-    popularity = result.get(
-        "popularity",
-        0,
-    )
+    if difference == 1:
+        add_reason(reasons, 12, "Year off by one")
+        return 12, reasons
 
-    # Tiny ranking bonus only.
-    # Popularity must never overpower
-    # a better title match.
+    add_reason(reasons, -25, "Year mismatch")
+    return -25, reasons
+
+
+def score_country_hint(parsed, result):
+    hint = parsed.get("country_hint")
+    if not hint:
+        return 0, []
+
+    countries = [
+        str(country).upper()
+        for country in (result.get("origin_country") or [])
+    ]
+
+    if hint.upper() in countries:
+        reasons = []
+        add_reason(reasons, 15, f"Country hint {hint}")
+        return 15, reasons
+
+    reasons = []
+    add_reason(reasons, -8, f"Country hint {hint} mismatch")
+    return -8, reasons
+
+
+def popularity_tiebreaker(popularity):
+    # Deliberately tiny. Popularity is useful only for ordering otherwise
+    # similar candidates and must never manufacture confidence.
+    if popularity >= 100:
+        return 3
+    if popularity >= 25:
+        return 2
     if popularity > 0:
-        score += 5
+        return 1
+    return 0
 
-    return max(
-        0,
-        min(100, round(score)),
+
+def finalize_score(points):
+    return max(0, min(100, round(points)))
+
+
+def score_movie_candidate(parsed, result):
+    title_points, reasons, similarity = score_title(
+        parsed["title"],
+        result.get("title", ""),
+        result.get("original_title", ""),
     )
+
+    year_points, year_reasons = score_year(
+        parsed.get("year"),
+        year_from_date(result.get("release_date")),
+    )
+    reasons.extend(year_reasons)
+
+    popularity_points = popularity_tiebreaker(
+        result.get("popularity", 0)
+    )
+    if popularity_points:
+        add_reason(reasons, popularity_points, "Popularity tie-breaker")
+
+    score = finalize_score(
+        title_points + year_points + popularity_points
+    )
+
+    return score, reasons, similarity
+
+
+def score_tv_candidate(parsed, result):
+    title_points, reasons, similarity = score_title(
+        parsed["title"],
+        result.get("name", ""),
+        result.get("original_name", ""),
+    )
+
+    year_points, year_reasons = score_year(
+        parsed.get("year"),
+        year_from_date(result.get("first_air_date")),
+    )
+    reasons.extend(year_reasons)
+
+    country_points, country_reasons = score_country_hint(
+        parsed,
+        result,
+    )
+    reasons.extend(country_reasons)
+
+    popularity_points = popularity_tiebreaker(
+        result.get("popularity", 0)
+    )
+    if popularity_points:
+        add_reason(reasons, popularity_points, "Popularity tie-breaker")
+
+    score = finalize_score(
+        title_points
+        + year_points
+        + country_points
+        + popularity_points
+    )
+
+    return score, reasons, similarity
 
 
 def search_movie_candidates(parsed):
@@ -232,7 +284,7 @@ def search_movie_candidates(parsed):
         []
     )[:10]:
 
-        score = score_movie_candidate(
+        score, score_reasons, title_similarity_value = score_movie_candidate(
             parsed,
             result,
         )
@@ -268,6 +320,8 @@ def search_movie_candidates(parsed):
                 "original_language": result.get("original_language", ""),
                 "origin_country": result.get("origin_country", []),
                 "popularity": result.get("popularity", 0),
+                "title_similarity": title_similarity_value,
+                "score_reasons": score_reasons,
                 "score": score,
             }
         )
@@ -296,7 +350,10 @@ def search_tv_candidates(parsed):
     )
 
     for result in data.get("results", [])[:10]:
-        score = score_tv_candidate(parsed, result)
+        score, score_reasons, title_similarity_value = score_tv_candidate(
+            parsed,
+            result,
+        )
         episode_details = []
         missing_episodes = []
 
@@ -324,11 +381,13 @@ def search_tv_candidates(parsed):
                 missing_episodes.append(episode_number)
 
         if episode_details and not missing_episodes:
-            score = min(100, score + 5)
+            episode_points = 25
+            add_reason(score_reasons, episode_points, "All requested episodes found")
+            score = finalize_score(score + episode_points)
         elif missing_episodes:
-            # A multi-episode candidate is only valid if every requested
-            # episode exists for the same show and season.
-            score = max(0, score - 40)
+            episode_points = -40
+            add_reason(score_reasons, episode_points, "Requested episode(s) missing")
+            score = finalize_score(score + episode_points)
 
         episode_titles = [
             item["name"]
@@ -356,6 +415,8 @@ def search_tv_candidates(parsed):
                 "original_language": result.get("original_language", ""),
                 "origin_country": result.get("origin_country", []),
                 "popularity": result.get("popularity", 0),
+                "title_similarity": title_similarity_value,
+                "score_reasons": score_reasons,
                 "season": parsed["season"],
                 "episode": requested_episodes[0],
                 "episodes": requested_episodes.copy(),
@@ -449,10 +510,19 @@ def match_media(parsed):
         competing_exact_matches.append(candidate)
 
     if competing_exact_matches:
-        best["confidence"] = "Review"
-        best["ambiguity_reason"] = (
-            "Multiple matching titles found"
+        has_resolving_hint = bool(
+            parsed.get("year")
+            or parsed.get("country_hint")
         )
+
+        second_score = competing_exact_matches[0].get("score", 0)
+        score_gap = best["score"] - second_score
+
+        if not has_resolving_hint or score_gap < 15:
+            best["confidence"] = "Review"
+            best["ambiguity_reason"] = (
+                "Multiple matching titles found"
+            )
 
     # Also review candidates whose scores are very close.
     elif len(candidates) > 1:

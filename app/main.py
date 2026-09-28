@@ -633,9 +633,22 @@ class MatchSelectionDialog(QDialog):
         requested = ""
         if parsed.get("type") == "TV":
             requested = f" • Requested: {format_episode_code(parsed)}"
+        hints = []
+        if parsed.get("year"):
+            hints.append(f"year {parsed['year']}")
+        if parsed.get("country_hint"):
+            hints.append(f"country {parsed['country_hint']}")
+
+        hint_text = (
+            f" • Filename hints: {', '.join(hints)}"
+            if hints
+            else ""
+        )
+
         explanation = QLabel(
             "Rogue Renamer found possible metadata matches"
-            f"{requested}. Select a title to inspect its details."
+            f"{requested}{hint_text}. "
+            "Select a title to inspect its details."
         )
         explanation.setWordWrap(True)
         layout.addWidget(explanation)
@@ -666,12 +679,12 @@ class MatchSelectionDialog(QDialog):
                     else "episode(s) missing"
                 )
                 detail = (
-                    f"{title} ({year}){country_text}\\n"
+                    f"{title} ({year}){country_text}\n"
                     f"TMDB #{candidate.get('id', '?')}   •   {state}   •   Score {score}"
                 )
             else:
                 detail = (
-                    f"{title} ({year}){country_text}\\n"
+                    f"{title} ({year}){country_text}\n"
                     f"TMDB #{candidate.get('id', '?')}   •   Score {score}"
                 )
 
@@ -815,12 +828,21 @@ class MatchSelectionDialog(QDialog):
         if original_title and original_title.casefold() != title.casefold():
             original_line = f"<br><b>Original title:</b> {original_title}"
 
+        score_reasons = candidate.get("score_reasons") or []
+        score_breakdown = ""
+        if score_reasons:
+            score_breakdown = (
+                "<br><b>Why:</b> "
+                + " • ".join(score_reasons)
+            )
+
         self.detail_meta.setText(
             f"<b>TMDB ID:</b> {tmdb_id}<br>"
             f"<b>{date_label}:</b> {date_value}<br>"
             f"<b>Country:</b> {country_text}<br>"
             f"<b>Original language:</b> {language}<br>"
             f"<b>Match score:</b> {score}/100"
+            f"{score_breakdown}"
             f"{original_line}"
         )
 

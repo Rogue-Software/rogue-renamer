@@ -120,6 +120,48 @@ def clean_title(text):
     return re.sub(r"\s+", " ", text).strip()
 
 
+
+REGION_HINTS = {
+    "us": "US",
+    "usa": "US",
+    "uk": "GB",
+    "gb": "GB",
+    "au": "AU",
+    "aus": "AU",
+    "ca": "CA",
+    "can": "CA",
+    "nz": "NZ",
+}
+
+
+def extract_tv_hints(raw_title):
+    normalized = re.sub(r"[._-]+", " ", raw_title)
+    tokens = normalized.split()
+
+    year = None
+    country_hint = None
+    kept = []
+
+    for token in tokens:
+        lower = token.lower().strip("()[]")
+
+        if re.fullmatch(r"(?:19|20)\d{2}", lower):
+            year = int(lower)
+            continue
+
+        if lower in REGION_HINTS:
+            country_hint = REGION_HINTS[lower]
+            continue
+
+        kept.append(token)
+
+    return {
+        "title": clean_title(" ".join(kept)),
+        "year": year,
+        "country_hint": country_hint,
+    }
+
+
 def parse_filename(filepath):
     path = Path(filepath)
     stem = path.stem
@@ -131,7 +173,8 @@ def parse_filename(filepath):
     )
 
     if first:
-        title = clean_title(first.group(1))
+        hints = extract_tv_hints(first.group(1))
+        title = hints["title"]
         season = int(first.group(2))
         episodes = [int(first.group(3))]
 
@@ -162,7 +205,8 @@ def parse_filename(filepath):
             "season": season,
             "episode": episodes[0],
             "episodes": episodes,
-            "year": None,
+            "year": hints["year"],
+            "country_hint": hints["country_hint"],
         }
 
     # 1x01, 1x01-1x02, 1x01x02
@@ -172,7 +216,8 @@ def parse_filename(filepath):
     )
 
     if first:
-        title = clean_title(first.group(1))
+        hints = extract_tv_hints(first.group(1))
+        title = hints["title"]
         season = int(first.group(2))
         episodes = [int(first.group(3))]
         tail = stem[first.end():]
@@ -204,7 +249,8 @@ def parse_filename(filepath):
             "season": season,
             "episode": episodes[0],
             "episodes": episodes,
-            "year": None,
+            "year": hints["year"],
+            "country_hint": hints["country_hint"],
         }
 
     # Movie with year
@@ -221,6 +267,7 @@ def parse_filename(filepath):
             "episode": None,
             "episodes": [],
             "year": int(year_match.group(2)),
+            "country_hint": None,
         }
 
     return {
@@ -230,5 +277,6 @@ def parse_filename(filepath):
         "episode": None,
         "episodes": [],
         "year": None,
+        "country_hint": None,
     }
 
