@@ -20,6 +20,10 @@ DEFAULT_CONFIG = {
         "movie_folder_template": "{title} ({year})",
         "tv_folder_template": "{title}/Season {season:02d}",
     },
+    "automation": {
+        "auto_accept_threshold": 90,
+        "review_all_matches": False,
+    },
 }
 
 
@@ -79,6 +83,7 @@ def load_config():
         "tmdb": DEFAULT_CONFIG["tmdb"].copy(),
         "naming": DEFAULT_CONFIG["naming"].copy(),
         "organization": DEFAULT_CONFIG["organization"].copy(),
+        "automation": DEFAULT_CONFIG["automation"].copy(),
     }
 
     config_file = get_config_file()
@@ -98,6 +103,9 @@ def load_config():
 
         if isinstance(saved.get("organization"), dict):
             config["organization"].update(saved["organization"])
+
+        if isinstance(saved.get("automation"), dict):
+            config["automation"].update(saved["automation"])
 
         return config
 

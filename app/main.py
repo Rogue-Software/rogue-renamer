@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -273,7 +274,7 @@ class SettingsDialog(QDialog):
             "Rogue Renamer Settings"
         )
 
-        self.resize(780, 650)
+        self.resize(780, 780)
 
         self.config = load_config()
 
@@ -423,6 +424,44 @@ class SettingsDialog(QDialog):
             self.tv_folder_input,
         )
         layout.addLayout(organization_form)
+
+        automation_title = QLabel("Batch Automation")
+        automation_title.setStyleSheet(
+            "font-size: 20px; font-weight: bold; margin-top: 12px;"
+        )
+        layout.addWidget(automation_title)
+
+        automation = self.config.get("automation", {})
+
+        automation_help = QLabel(
+            "High-confidence matches at or above the threshold are accepted "
+            "automatically. Ambiguous or lower-scoring matches stay queued for review."
+        )
+        automation_help.setWordWrap(True)
+        automation_help.setStyleSheet("color: #aaaaaa;")
+        layout.addWidget(automation_help)
+
+        automation_form = QFormLayout()
+
+        self.auto_accept_threshold = QSpinBox()
+        self.auto_accept_threshold.setRange(50, 100)
+        self.auto_accept_threshold.setSuffix(" / 100")
+        self.auto_accept_threshold.setValue(
+            int(automation.get("auto_accept_threshold", 90))
+        )
+        automation_form.addRow(
+            "Auto-accept threshold:",
+            self.auto_accept_threshold,
+        )
+        layout.addLayout(automation_form)
+
+        self.review_all_checkbox = QCheckBox(
+            "Review all matches (disable automatic acceptance)"
+        )
+        self.review_all_checkbox.setChecked(
+            bool(automation.get("review_all_matches", False))
+        )
+        layout.addWidget(self.review_all_checkbox)
 
         self.connection_status = QLabel(
             "Connection not tested"
@@ -605,6 +644,11 @@ class SettingsDialog(QDialog):
             "enabled": self.organize_checkbox.isChecked(),
             "movie_folder_template": movie_folder_template,
             "tv_folder_template": tv_folder_template,
+        }
+
+        self.config["automation"] = {
+            "auto_accept_threshold": self.auto_accept_threshold.value(),
+            "review_all_matches": self.review_all_checkbox.isChecked(),
         }
 
         save_config(self.config)
@@ -1382,6 +1426,14 @@ class RogueRenamer(QMainWindow):
             self.search_metadata
         )
 
+        self.review_button = QPushButton(
+            "Review Matches"
+        )
+        self.review_button.setEnabled(False)
+        self.review_button.clicked.connect(
+            self.review_next_match
+        )
+
         self.rename_button = QPushButton(
             "Rename Files"
         )
@@ -1411,6 +1463,10 @@ class RogueRenamer(QMainWindow):
 
         footer.addWidget(
             self.search_button
+        )
+
+        footer.addWidget(
+            self.review_button
         )
 
         footer.addWidget(
@@ -1942,7 +1998,104 @@ class RogueRenamer(QMainWindow):
 
         self.update_status()
 
+    def get_automation_settings(self):
+        config = load_config()
+        automation = config.get("automation", {})
+        return {
+            "auto_accept_threshold": int(
+                automation.get("auto_accept_threshold", 90)
+            ),
+            "review_all_matches": bool(
+                automation.get("review_all_matches", False)
+            ),
+        }
+
+    def row_needs_review(self, row):
+        status_item = self.table.item(row, 7)
+        status = status_item.text() if status_item else ""
+        return (
+            "Review" in status
+            or "Low Match" in status
+            or "Needs Review" in status
+        )
+
+    def review_next_match(self):
+        for row in range(self.table.rowCount()):
+            if self.row_needs_review(row):
+                match_item = self.table.item(row, 4)
+                if (
+                    match_item
+                    and match_item.data(Qt.ItemDataRole.UserRole)
+                ):
+                    self.table.selectRow(row)
+                    self.table.scrollToItem(match_item)
+                    self.review_match(row, 4)
+                    return
+
+        QMessageBox.information(
+            self,
+            "Review Matches",
+            "There are no queued metadata matches to review.",
+        )
+
+    def update_batch_summary(self):
+        count = self.table.rowCount()
+
+        if count == 0:
+            self.status_label.setText("0 files loaded")
+            self.review_button.setEnabled(False)
+            return
+
+        ready = 0
+        review = 0
+        failed = 0
+        pending = 0
+
+        for row in range(count):
+            status_item = self.table.item(row, 7)
+            status = status_item.text() if status_item else ""
+
+            if (
+                "No Match" in status
+                or "Error:" in status
+            ):
+                failed += 1
+            elif self.row_needs_review(row):
+                review += 1
+            elif (
+                "Ready to Search" in status
+                or "Searching" in status
+            ):
+                pending += 1
+            elif (
+                "High Match" in status
+                or "Auto Accepted" in status
+                or "Manually Confirmed" in status
+                or "Renamed" in status
+                or "Undo Complete" in status
+            ):
+                ready += 1
+            else:
+                pending += 1
+
+        parts = [f"{count} file{'s' if count != 1 else ''}"]
+        if ready:
+            parts.append(f"{ready} Ready")
+        if review:
+            parts.append(f"{review} Need Review")
+        if failed:
+            parts.append(f"{failed} Failed")
+        if pending:
+            parts.append(f"{pending} Pending")
+
+        self.status_label.setText(" • ".join(parts))
+        self.review_button.setEnabled(review > 0)
+
     def search_metadata(self):
+        automation = self.get_automation_settings()
+        threshold = automation["auto_accept_threshold"]
+        review_all = automation["review_all_matches"]
+
         self.search_button.setEnabled(
             False
         )
@@ -2080,9 +2233,25 @@ class RogueRenamer(QMainWindow):
                     0,
                 )
 
-                if confidence == "High":
+                auto_accept = (
+                    not review_all
+                    and confidence == "High"
+                    and score >= threshold
+                )
+
+                if auto_accept:
                     status = (
-                        f"✓ High Match ({score})"
+                        f"✓ Auto Accepted ({score})"
+                    )
+
+                elif review_all:
+                    status = (
+                        f"⚠ Review — review-all enabled ({score})"
+                    )
+
+                elif confidence == "High":
+                    status = (
+                        f"⚠ Review — below {threshold} threshold ({score})"
                     )
 
                 elif confidence == "Review":
@@ -2107,6 +2276,7 @@ class RogueRenamer(QMainWindow):
             self.search_button.setEnabled(
                 True
             )
+            self.update_batch_summary()
             self.update_rename_state()
 
 
@@ -2243,6 +2413,7 @@ class RogueRenamer(QMainWindow):
             ),
         )
 
+        self.update_batch_summary()
         self.update_rename_state()
 
     def update_rename_state(self):
@@ -2608,19 +2779,10 @@ class RogueRenamer(QMainWindow):
         self.update_rename_state()
 
     def update_status(self):
-        count = (
-            self.table.rowCount()
-        )
+        count = self.table.rowCount()
+        self.update_batch_summary()
+        self.search_button.setEnabled(count > 0)
 
-        self.status_label.setText(
-            f"{count} file"
-            f"{'s' if count != 1 else ''}"
-            " loaded"
-        )
-
-        self.search_button.setEnabled(
-            count > 0
-        )
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
