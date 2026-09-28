@@ -46,6 +46,34 @@ def get_config_file():
     return get_config_dir() / "config.json"
 
 
+def get_history_file():
+    return get_config_dir() / "rename_history.json"
+
+
+def load_rename_history():
+    history_file = get_history_file()
+
+    if not history_file.exists():
+        return []
+
+    try:
+        with open(history_file, "r", encoding="utf-8") as file:
+            history = json.load(file)
+
+        return history if isinstance(history, list) else []
+
+    except (OSError, json.JSONDecodeError, TypeError):
+        return []
+
+
+def save_rename_history(history):
+    config_dir = get_config_dir()
+    config_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(get_history_file(), "w", encoding="utf-8") as file:
+        json.dump(history, file, indent=4)
+
+
 def load_config():
     config = {
         "tmdb": DEFAULT_CONFIG["tmdb"].copy(),

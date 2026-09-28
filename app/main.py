@@ -1,5 +1,7 @@
 import os
 import sys
+import uuid
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QByteArray
@@ -42,6 +44,8 @@ from app.parser import (
 from app.settings import (
     load_config,
     save_config,
+    load_rename_history,
+    save_rename_history,
 )
 
 
@@ -948,6 +952,189 @@ class RenameConfirmationDialog(QDialog):
         layout.addLayout(buttons)
 
 
+class RenameHistoryDialog(QDialog):
+    def __init__(self, history, parent=None):
+        super().__init__(parent)
+
+        self.history = history
+        self.selected_batch_id = None
+
+        self.setWindowTitle("Rename History")
+        self.resize(1050, 650)
+        self.setMinimumSize(800, 500)
+
+        layout = QVBoxLayout(self)
+
+        heading = QLabel("Rename History")
+        heading.setStyleSheet("font-size: 22px; font-weight: bold;")
+        layout.addWidget(heading)
+
+        explanation = QLabel(
+            "Previous rename batches are stored locally. "
+            "Select an active batch to review it or restore the original filenames."
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+
+        content = QHBoxLayout()
+
+        self.batch_list = QListWidget()
+        self.batch_list.setMinimumWidth(360)
+        self.batch_list.setStyleSheet("""
+            QListWidget {
+                background: #1d2024;
+                color: #eeeeee;
+                border: 1px solid #444;
+            }
+            QListWidget::item {
+                padding: 10px;
+                border-bottom: 1px solid #30343a;
+            }
+            QListWidget::item:selected {
+                background: #3b4654;
+                color: #ffffff;
+            }
+        """)
+        content.addWidget(self.batch_list, 4)
+
+        self.details = QTextEdit()
+        self.details.setReadOnly(True)
+        self.details.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        self.details.setStyleSheet("""
+            QTextEdit {
+                background: #1d2024;
+                color: #eeeeee;
+                border: 1px solid #444;
+                padding: 8px;
+            }
+        """)
+        content.addWidget(self.details, 7)
+
+        layout.addLayout(content, 1)
+
+        buttons = QHBoxLayout()
+
+        self.undo_button = QPushButton("Undo Selected Batch")
+        self.undo_button.setEnabled(False)
+        self.undo_button.clicked.connect(self.request_undo)
+
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.reject)
+
+        buttons.addWidget(self.undo_button)
+        buttons.addStretch()
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+
+        self.batch_list.currentItemChanged.connect(
+            self.update_details
+        )
+
+        self.populate()
+
+    def populate(self):
+        self.batch_list.clear()
+
+        for batch in reversed(self.history):
+            status = batch.get("status", "renamed")
+            status_text = (
+                "ACTIVE"
+                if status == "renamed"
+                else "UNDONE"
+            )
+            timestamp = batch.get("timestamp", "Unknown time")
+            file_count = len(batch.get("items", []))
+            video_count = sum(
+                1
+                for item in batch.get("items", [])
+                if item.get("kind") == "video"
+            )
+
+            text = (
+                f"{timestamp}\n"
+                f"{status_text} • {video_count} video"
+                f"{'s' if video_count != 1 else ''} • "
+                f"{file_count} total file"
+                f"{'s' if file_count != 1 else ''}"
+            )
+
+            item = QListWidgetItem(text)
+            item.setData(
+                Qt.ItemDataRole.UserRole,
+                batch.get("id"),
+            )
+            self.batch_list.addItem(item)
+
+        if self.batch_list.count():
+            self.batch_list.setCurrentRow(0)
+        else:
+            self.details.setPlainText(
+                "No rename history yet."
+            )
+
+    def update_details(self, current, previous):
+        if not current:
+            self.details.clear()
+            self.undo_button.setEnabled(False)
+            return
+
+        batch_id = current.data(
+            Qt.ItemDataRole.UserRole
+        )
+        batch = next(
+            (
+                entry
+                for entry in self.history
+                if entry.get("id") == batch_id
+            ),
+            None,
+        )
+
+        if not batch:
+            self.details.clear()
+            self.undo_button.setEnabled(False)
+            return
+
+        lines = [
+            f"Date: {batch.get('timestamp', 'Unknown')}",
+            f"Status: {batch.get('status', 'renamed').upper()}",
+            "",
+        ]
+
+        for index, item in enumerate(
+            batch.get("items", []),
+            start=1,
+        ):
+            label = (
+                "COMPANION"
+                if item.get("kind") == "companion"
+                else "VIDEO"
+            )
+            lines.extend(
+                [
+                    f"{index}. [{label}]",
+                    f"   Original: {item.get('old', '')}",
+                    f"   Renamed:  {item.get('new', '')}",
+                    "",
+                ]
+            )
+
+        self.details.setPlainText("\n".join(lines))
+        self.undo_button.setEnabled(
+            batch.get("status") == "renamed"
+        )
+
+    def request_undo(self):
+        item = self.batch_list.currentItem()
+        if not item:
+            return
+
+        self.selected_batch_id = item.data(
+            Qt.ItemDataRole.UserRole
+        )
+        self.accept()
+
+
 class RogueRenamer(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -959,7 +1146,8 @@ class RogueRenamer(QMainWindow):
         self.resize(1500, 760)
 
         self.loaded_files = set()
-        self.last_rename_batch = []
+        self.rename_history = load_rename_history()
+        self.last_rename_batch = self.get_latest_active_batch_items()
 
         self.setAcceptDrops(True)
 
@@ -1003,8 +1191,18 @@ class RogueRenamer(QMainWindow):
             self.open_settings
         )
 
+        history_button = QPushButton(
+            "History"
+        )
+        history_button.clicked.connect(
+            self.open_history
+        )
+
         header.addLayout(titles)
         header.addStretch()
+        header.addWidget(
+            history_button
+        )
         header.addWidget(
             settings_button
         )
@@ -1176,7 +1374,9 @@ class RogueRenamer(QMainWindow):
         self.undo_button = QPushButton(
             "Undo Last Rename"
         )
-        self.undo_button.setEnabled(False)
+        self.undo_button.setEnabled(
+            bool(self.last_rename_batch)
+        )
         self.undo_button.clicked.connect(
             self.undo_last_rename
         )
@@ -1251,6 +1451,288 @@ class RogueRenamer(QMainWindow):
                 font-weight: bold;
             }
             """
+        )
+
+    def get_latest_active_batch(self):
+        for batch in reversed(self.rename_history):
+            if batch.get("status") == "renamed":
+                return batch
+        return None
+
+    def get_latest_active_batch_items(self):
+        batch = self.get_latest_active_batch()
+        if not batch:
+            return []
+
+        return [
+            {
+                "row": item.get("row"),
+                "old": Path(item["old"]),
+                "new": Path(item["new"]),
+                "kind": item.get("kind", "video"),
+                "created_directories": [
+                    Path(path)
+                    for path in item.get(
+                        "created_directories",
+                        [],
+                    )
+                ],
+            }
+            for item in batch.get("items", [])
+        ]
+
+    def save_completed_batch(self, completed):
+        batch = {
+            "id": uuid.uuid4().hex,
+            "timestamp": datetime.now().astimezone().isoformat(
+                timespec="seconds"
+            ),
+            "status": "renamed",
+            "items": [
+                {
+                    "row": item.get("row"),
+                    "old": str(item["old"]),
+                    "new": str(item["new"]),
+                    "kind": item.get("kind", "video"),
+                    "created_directories": [
+                        str(path)
+                        for path in item.get(
+                            "created_directories",
+                            [],
+                        )
+                    ],
+                }
+                for item in completed
+            ],
+        }
+
+        self.rename_history.append(batch)
+
+        # Keep history useful without allowing the file to grow forever.
+        if len(self.rename_history) > 500:
+            self.rename_history = self.rename_history[-500:]
+
+        save_rename_history(self.rename_history)
+        return batch
+
+    def mark_batch_undone(self, batch_id):
+        for batch in self.rename_history:
+            if batch.get("id") == batch_id:
+                batch["status"] = "undone"
+                batch["undone_at"] = (
+                    datetime.now()
+                    .astimezone()
+                    .isoformat(timespec="seconds")
+                )
+                break
+
+        save_rename_history(self.rename_history)
+
+    def open_history(self):
+        dialog = RenameHistoryDialog(
+            self.rename_history,
+            self,
+        )
+        dialog.setStyleSheet(
+            self.styleSheet()
+        )
+
+        if (
+            dialog.exec()
+            != QDialog.DialogCode.Accepted
+        ):
+            return
+
+        if dialog.selected_batch_id:
+            self.undo_history_batch(
+                dialog.selected_batch_id
+            )
+
+    def update_loaded_rows_after_undo(self, batch_items):
+        for item in batch_items:
+            if item.get("kind") != "video":
+                continue
+
+            old_path = item["old"]
+            new_path = item["new"]
+
+            for row in range(self.table.rowCount()):
+                original_item = self.table.item(row, 0)
+                if not original_item:
+                    continue
+
+                current_path = original_item.data(
+                    Qt.ItemDataRole.UserRole
+                )
+
+                if (
+                    current_path
+                    and str(Path(current_path)).casefold()
+                    == str(new_path).casefold()
+                ):
+                    original_item.setText(old_path.name)
+                    original_item.setData(
+                        Qt.ItemDataRole.UserRole,
+                        str(old_path),
+                    )
+                    self.table.setItem(
+                        row,
+                        7,
+                        QTableWidgetItem(
+                            "✓ Undo Complete"
+                        ),
+                    )
+
+        self.loaded_files = {
+            self.table.item(row, 0).data(
+                Qt.ItemDataRole.UserRole
+            )
+            for row in range(
+                self.table.rowCount()
+            )
+            if self.table.item(row, 0)
+        }
+
+    def undo_history_batch(self, batch_id):
+        batch = next(
+            (
+                entry
+                for entry in self.rename_history
+                if entry.get("id") == batch_id
+            ),
+            None,
+        )
+
+        if not batch or batch.get("status") != "renamed":
+            QMessageBox.information(
+                self,
+                "History",
+                "That rename batch is no longer active.",
+            )
+            return
+
+        batch_items = [
+            {
+                "row": item.get("row"),
+                "old": Path(item["old"]),
+                "new": Path(item["new"]),
+                "kind": item.get("kind", "video"),
+                "created_directories": [
+                    Path(path)
+                    for path in item.get(
+                        "created_directories",
+                        [],
+                    )
+                ],
+            }
+            for item in batch.get("items", [])
+        ]
+
+        errors = []
+
+        for item in batch_items:
+            if not item["new"].exists():
+                errors.append(
+                    f"Renamed file is missing: {item['new']}"
+                )
+
+            if item["old"].exists():
+                errors.append(
+                    f"Original filename is already occupied: "
+                    f"{item['old']}"
+                )
+
+        if errors:
+            QMessageBox.critical(
+                self,
+                "Undo Blocked",
+                "Rogue Renamer cannot safely undo this batch:\n\n"
+                + "\n".join(errors[:12]),
+            )
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Undo Rename Batch",
+            f"Restore the original names for "
+            f"{len(batch_items)} file(s)?",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        undone = []
+
+        try:
+            for item in reversed(batch_items):
+                item["new"].rename(
+                    item["old"]
+                )
+
+                for directory in item.get(
+                    "created_directories",
+                    [],
+                ):
+                    try:
+                        directory.rmdir()
+                    except OSError:
+                        pass
+
+                undone.append(item)
+
+        except Exception as error:
+            rollback_errors = []
+
+            for item in reversed(undone):
+                try:
+                    if (
+                        item["old"].exists()
+                        and not item["new"].exists()
+                    ):
+                        item["old"].rename(
+                            item["new"]
+                        )
+                except Exception as rollback_error:
+                    rollback_errors.append(
+                        str(rollback_error)
+                    )
+
+            message = f"Undo failed:\n\n{error}"
+
+            if rollback_errors:
+                message += (
+                    "\n\nSome recovery operations also failed:\n"
+                    + "\n".join(rollback_errors)
+                )
+
+            QMessageBox.critical(
+                self,
+                "Undo Failed",
+                message,
+            )
+            return
+
+        self.mark_batch_undone(batch_id)
+        self.update_loaded_rows_after_undo(
+            batch_items
+        )
+
+        latest = self.get_latest_active_batch()
+        self.last_rename_batch = (
+            self.get_latest_active_batch_items()
+        )
+        self.undo_button.setEnabled(
+            bool(latest)
+        )
+        self.update_rename_state()
+
+        QMessageBox.information(
+            self,
+            "Undo Complete",
+            "The original filenames have been restored.",
         )
 
     def open_settings(self):
@@ -2013,6 +2495,7 @@ class RogueRenamer(QMainWindow):
             )
             return
 
+        self.save_completed_batch(completed)
         self.last_rename_batch = completed
         self.undo_button.setEnabled(
             bool(completed)
@@ -2080,151 +2563,17 @@ class RogueRenamer(QMainWindow):
         )
 
     def undo_last_rename(self):
-        if not self.last_rename_batch:
+        batch = self.get_latest_active_batch()
+
+        if not batch:
+            self.last_rename_batch = []
+            self.undo_button.setEnabled(False)
             return
 
-        # Validate the entire undo first.
-        errors = []
-
-        for item in self.last_rename_batch:
-            old_path = item["old"]
-            new_path = item["new"]
-
-            if not new_path.exists():
-                errors.append(
-                    f"Renamed file is missing: {new_path}"
-                )
-
-            if old_path.exists():
-                errors.append(
-                    f"Original filename is already occupied: "
-                    f"{old_path}"
-                )
-
-        if errors:
-            QMessageBox.critical(
-                self,
-                "Undo Blocked",
-                "Rogue Renamer cannot safely undo this batch:\n\n"
-                + "\n".join(errors[:12]),
-            )
-            return
-
-        answer = QMessageBox.question(
-            self,
-            "Undo Last Rename",
-            f"Restore the original names for "
-            f"{len(self.last_rename_batch)} file(s)?",
-            QMessageBox.StandardButton.Yes
-            | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
+        self.undo_history_batch(
+            batch.get("id")
         )
 
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-
-        undone = []
-
-        try:
-            for item in reversed(
-                self.last_rename_batch
-            ):
-                item["new"].rename(
-                    item["old"]
-                )
-
-                for directory in item.get(
-                    "created_directories",
-                    [],
-                ):
-                    try:
-                        directory.rmdir()
-                    except OSError:
-                        pass
-
-                undone.append(item)
-
-        except Exception as error:
-            # Best effort: put already-undone files back to
-            # their renamed state so the batch stays consistent.
-            rollback_errors = []
-
-            for item in reversed(undone):
-                try:
-                    if (
-                        item["old"].exists()
-                        and not item["new"].exists()
-                    ):
-                        item["old"].rename(
-                            item["new"]
-                        )
-                except Exception as rollback_error:
-                    rollback_errors.append(
-                        str(rollback_error)
-                    )
-
-            message = (
-                f"Undo failed:\n\n{error}"
-            )
-
-            if rollback_errors:
-                message += (
-                    "\n\nSome recovery operations also failed:\n"
-                    + "\n".join(rollback_errors)
-                )
-
-            QMessageBox.critical(
-                self,
-                "Undo Failed",
-                message,
-            )
-            return
-
-        for item in self.last_rename_batch:
-            if item.get("kind") != "video":
-                continue
-
-            row = item["row"]
-            old_path = item["old"]
-
-            original_item = self.table.item(
-                row,
-                0,
-            )
-            original_item.setText(
-                old_path.name
-            )
-            original_item.setData(
-                Qt.ItemDataRole.UserRole,
-                str(old_path),
-            )
-
-            self.table.setItem(
-                row,
-                7,
-                QTableWidgetItem(
-                    "✓ Undo Complete"
-                ),
-            )
-
-        self.loaded_files = {
-            self.table.item(row, 0).data(
-                Qt.ItemDataRole.UserRole
-            )
-            for row in range(
-                self.table.rowCount()
-            )
-        }
-
-        self.last_rename_batch = []
-        self.undo_button.setEnabled(False)
-        self.update_rename_state()
-
-        QMessageBox.information(
-            self,
-            "Undo Complete",
-            "The original filenames have been restored.",
-        )
 
     def clear_files(self):
         self.table.setRowCount(
