@@ -1,4 +1,5 @@
 import re
+from difflib import SequenceMatcher
 
 import requests
 
@@ -16,8 +17,7 @@ def get_headers():
     config = load_config()
 
     token = (
-        config
-        .get("tmdb", {})
+        config.get("tmdb", {})
         .get("access_token", "")
         .strip()
     )
@@ -67,132 +67,420 @@ def year_from_date(date_string):
     return int(match.group(1))
 
 
-def search_movie(title, year=None):
+def normalize_title(title):
+    title = title.lower()
+
+    title = re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        title,
+    )
+
+    return re.sub(
+        r"\s+",
+        " ",
+        title,
+    ).strip()
+
+
+def title_similarity(first, second):
+    first = normalize_title(first)
+    second = normalize_title(second)
+
+    if first == second:
+        return 1.0
+
+    return SequenceMatcher(
+        None,
+        first,
+        second,
+    ).ratio()
+
+
+def confidence_label(score):
+    if score >= 85:
+        return "High"
+
+    if score >= 50:
+        return "Review"
+
+    return "Low"
+
+
+def score_movie_candidate(
+    parsed,
+    result,
+):
+    parsed_title = parsed["title"]
+
+    tmdb_title = result.get(
+        "title",
+        "",
+    )
+
+    original_title = result.get(
+        "original_title",
+        "",
+    )
+
+    similarity = max(
+        title_similarity(
+            parsed_title,
+            tmdb_title,
+        ),
+        title_similarity(
+            parsed_title,
+            original_title,
+        ),
+    )
+
+    # Title contributes up to 75 points.
+    score = similarity * 75
+
+    parsed_year = parsed.get("year")
+
+    result_year = year_from_date(
+        result.get("release_date")
+    )
+
+    # A known year is extremely useful
+    # for distinguishing remakes.
+    if parsed_year and result_year:
+        if parsed_year == result_year:
+            score += 25
+
+        elif abs(parsed_year - result_year) == 1:
+            score += 10
+
+        else:
+            score -= 20
+
+    return max(
+        0,
+        min(100, round(score)),
+    )
+
+
+def score_tv_candidate(
+    parsed,
+    result,
+):
+    parsed_title = parsed["title"]
+
+    tmdb_title = result.get(
+        "name",
+        "",
+    )
+
+    original_title = result.get(
+        "original_name",
+        "",
+    )
+
+    similarity = max(
+        title_similarity(
+            parsed_title,
+            tmdb_title,
+        ),
+        title_similarity(
+            parsed_title,
+            original_title,
+        ),
+    )
+
+    # We don't normally have a year
+    # in SxxExx filenames, so title
+    # similarity carries most weight.
+    score = similarity * 90
+
+    popularity = result.get(
+        "popularity",
+        0,
+    )
+
+    # Tiny ranking bonus only.
+    # Popularity must never overpower
+    # a better title match.
+    if popularity > 0:
+        score += 5
+
+    return max(
+        0,
+        min(100, round(score)),
+    )
+
+
+def search_movie_candidates(parsed):
     params = {
-        "query": title,
+        "query": parsed["title"],
         "include_adult": "false",
     }
 
-    if year:
-        params["year"] = year
+    # Don't restrict the TMDB search by year.
+    # We want to see competing remakes too,
+    # then score the year ourselves.
 
     data = request_tmdb(
         "/search/movie",
         params,
     )
 
-    results = data.get("results", [])
+    candidates = []
 
-    if not results:
-        return None
+    for result in data.get(
+        "results",
+        []
+    )[:10]:
 
-    # TMDB already ranks its search results.
-    result = results[0]
+        score = score_movie_candidate(
+            parsed,
+            result,
+        )
 
-    return {
-        "id": result["id"],
-        "title": result.get("title", title),
-        "year": year_from_date(
-            result.get("release_date")
-        ),
-        "overview": result.get("overview", ""),
-    }
+        candidates.append(
+            {
+                "id": result["id"],
+                "type": "Movie",
+                "title": result.get(
+                    "title",
+                    parsed["title"],
+                ),
+                "original_title":
+                    result.get(
+                        "original_title",
+                        "",
+                    ),
+                "year": year_from_date(
+                    result.get(
+                        "release_date"
+                    )
+                ),
+                "overview":
+                    result.get(
+                        "overview",
+                        "",
+                    ),
+                "poster_path":
+                    result.get(
+                        "poster_path"
+                    ),
+                "score": score,
+            }
+        )
+
+    candidates.sort(
+        key=lambda item: item["score"],
+        reverse=True,
+    )
+
+    return candidates
 
 
-def search_tv(title):
+def search_tv_candidates(parsed):
     data = request_tmdb(
         "/search/tv",
         {
-            "query": title,
+            "query": parsed["title"],
             "include_adult": "false",
         },
     )
 
-    results = data.get("results", [])
+    candidates = []
 
-    if not results:
-        return None
+    for result in data.get(
+        "results",
+        []
+    )[:10]:
 
-    result = results[0]
-
-    return {
-        "id": result["id"],
-        "title": result.get("name", title),
-        "year": year_from_date(
-            result.get("first_air_date")
-        ),
-        "overview": result.get("overview", ""),
-    }
-
-
-def get_tv_episode(
-    show_id,
-    season,
-    episode,
-):
-    try:
-        data = request_tmdb(
-            f"/tv/{show_id}/season/{season}/episode/{episode}"
+        score = score_tv_candidate(
+            parsed,
+            result,
         )
 
-    except TMDBError:
-        return None
+        # Verify that the requested
+        # episode actually exists.
+        episode = None
 
-    return {
-        "id": data.get("id"),
-        "name": data.get(
-            "name",
-            f"Episode {episode}",
-        ),
-        "air_date": data.get("air_date"),
-    }
+        try:
+            episode_data = request_tmdb(
+                f"/tv/{result['id']}"
+                f"/season/{parsed['season']}"
+                f"/episode/{parsed['episode']}"
+            )
+
+            episode = {
+                "id":
+                    episode_data.get("id"),
+
+                "name":
+                    episode_data.get(
+                        "name",
+                        f"Episode "
+                        f"{parsed['episode']}",
+                    ),
+
+                "air_date":
+                    episode_data.get(
+                        "air_date"
+                    ),
+            }
+
+            # Existing requested episode
+            # is strong evidence.
+            score = min(
+                100,
+                score + 5,
+            )
+
+        except TMDBError:
+            # If SxxExx doesn't exist for
+            # this candidate, heavily
+            # penalize it.
+            score = max(
+                0,
+                score - 40,
+            )
+
+        candidates.append(
+            {
+                "id": result["id"],
+                "type": "TV",
+                "title": result.get(
+                    "name",
+                    parsed["title"],
+                ),
+                "original_title":
+                    result.get(
+                        "original_name",
+                        "",
+                    ),
+                "year": year_from_date(
+                    result.get(
+                        "first_air_date"
+                    )
+                ),
+                "overview":
+                    result.get(
+                        "overview",
+                        "",
+                    ),
+                "poster_path":
+                    result.get(
+                        "poster_path"
+                    ),
+                "season":
+                    parsed["season"],
+                "episode":
+                    parsed["episode"],
+                "episode_title":
+                    (
+                        episode["name"]
+                        if episode
+                        else None
+                    ),
+                "score": score,
+            }
+        )
+
+    candidates.sort(
+        key=lambda item: item["score"],
+        reverse=True,
+    )
+
+    return candidates
+
+
+def get_candidates(parsed):
+    if parsed["type"] == "Movie":
+        return search_movie_candidates(
+            parsed
+        )
+
+    if parsed["type"] == "TV":
+        return search_tv_candidates(
+            parsed
+        )
+
+    return []
 
 
 def match_media(parsed):
-    media_type = parsed["type"]
+    candidates = get_candidates(parsed)
 
-    if media_type == "Movie":
-        movie = search_movie(
-            parsed["title"],
-            parsed["year"],
+    if not candidates:
+        return None
+
+    # Copy the best candidate before attaching the candidate list.
+    # Do NOT attach candidates to candidates[0] directly: that creates a
+    # self-referential dictionary, which can cause PySide6/QVariant to
+    # recurse until Windows reports a stack overflow when setData() is used.
+    best = candidates[0].copy()
+
+    best["candidates"] = [
+        candidate.copy()
+        for candidate in candidates
+    ]
+    best["confidence"] = confidence_label(
+        best["score"]
+    )
+
+    # Detect genuinely ambiguous matches.
+    # Example: The.Office.S02E03.mkv can match multiple
+    # series named "The Office" that both contain S02E03.
+    best_normalized = normalize_title(
+        best["title"]
+    )
+
+    competing_exact_matches = []
+
+    for candidate in candidates[1:]:
+        candidate_normalized = normalize_title(
+            candidate["title"]
         )
 
-        if not movie:
-            return None
+        if candidate_normalized != best_normalized:
+            continue
 
-        return {
-            "type": "Movie",
-            "tmdb_id": movie["id"],
-            "title": movie["title"],
-            "year": movie["year"],
-            "episode_title": None,
-        }
+        # For TV, only treat another exact-title result as
+        # a serious competitor if the requested episode exists.
+        if parsed["type"] == "TV":
+            if not candidate.get("episode_title"):
+                continue
 
-    if media_type == "TV":
-        show = search_tv(
-            parsed["title"]
+        # A known movie year normally resolves remakes.
+        if parsed["type"] == "Movie":
+            parsed_year = parsed.get("year")
+
+            if (
+                parsed_year
+                and candidate.get("year") != parsed_year
+            ):
+                continue
+
+        competing_exact_matches.append(candidate)
+
+    if competing_exact_matches:
+        best["confidence"] = "Review"
+        best["ambiguity_reason"] = (
+            "Multiple matching titles found"
         )
 
-        if not show:
-            return None
+    # Also review candidates whose scores are very close.
+    elif len(candidates) > 1:
+        second = candidates[1]
 
-        episode = get_tv_episode(
-            show["id"],
-            parsed["season"],
-            parsed["episode"],
+        difference = (
+            best["score"]
+            - second["score"]
         )
 
-        if not episode:
-            return None
+        if (
+            best["score"] < 95
+            and difference <= 8
+        ):
+            best["confidence"] = "Review"
+            best["ambiguity_reason"] = (
+                "Multiple similar matches found"
+            )
 
-        return {
-            "type": "TV",
-            "tmdb_id": show["id"],
-            "title": show["title"],
-            "year": show["year"],
-            "season": parsed["season"],
-            "episode": parsed["episode"],
-            "episode_title": episode["name"],
-        }
-
-    return None
+    return best
