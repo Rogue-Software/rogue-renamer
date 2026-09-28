@@ -280,3 +280,116 @@ def parse_filename(filepath):
         "country_hint": None,
     }
 
+
+
+SEASON_FOLDER_RE = re.compile(r"(?i)^(?:season|series)[ ._-]*(\d{1,2})$")
+
+
+def folder_media_hints(filepath):
+    """Extract conservative title/year/season hints from parent folders."""
+    path = Path(filepath)
+    parents = list(path.parents)
+
+    season = None
+    title = None
+    year = None
+    country_hint = None
+
+    season_parent_index = None
+    for index, parent in enumerate(parents):
+        name = parent.name.strip()
+        match = SEASON_FOLDER_RE.fullmatch(name)
+        if match:
+            season = int(match.group(1))
+            season_parent_index = index
+            break
+
+    # For TV libraries, the folder directly above "Season 01" is normally
+    # the show folder. Otherwise use the immediate parent conservatively.
+    candidate_parent = None
+    if season_parent_index is not None and season_parent_index + 1 < len(parents):
+        candidate_parent = parents[season_parent_index + 1]
+    elif parents:
+        candidate_parent = parents[0]
+
+    if candidate_parent:
+        raw = candidate_parent.name.strip()
+        year_match = re.search(
+            r"(?i)^(.*?)[ ._(\[]((?:19|20)\d{2})(?:[ ._)\]]|$)",
+            raw,
+        )
+        if year_match:
+            title = clean_title(year_match.group(1))
+            year = int(year_match.group(2))
+        else:
+            hints = extract_tv_hints(raw)
+            title = hints["title"] or None
+            year = hints["year"]
+            country_hint = hints["country_hint"]
+
+    return {
+        "folder_title": title,
+        "folder_year": year,
+        "folder_season": season,
+        "folder_country_hint": country_hint,
+    }
+
+
+def parse_media_path(filepath):
+    """Parse a media file, using parent folders only when filename data is weak."""
+    parsed = parse_filename(filepath)
+    hints = folder_media_hints(filepath)
+
+    parsed["folder_title"] = hints["folder_title"]
+    parsed["folder_year"] = hints["folder_year"]
+    parsed["folder_season"] = hints["folder_season"]
+    parsed["folder_country_hint"] = hints["folder_country_hint"]
+
+    # A normal TV filename remains authoritative, but folder title/year/country
+    # can strengthen missing metadata.
+    if parsed["type"] == "TV":
+        if not parsed.get("year") and hints["folder_year"]:
+            parsed["year"] = hints["folder_year"]
+        if not parsed.get("country_hint") and hints["folder_country_hint"]:
+            parsed["country_hint"] = hints["folder_country_hint"]
+
+        # If the filename title is empty/generic, prefer the show folder.
+        if (
+            hints["folder_title"]
+            and (
+                not parsed.get("title")
+                or parsed["title"].casefold() in {"episode", "ep", "e"}
+            )
+        ):
+            parsed["title"] = hints["folder_title"]
+
+        return parsed
+
+    # Handle library layouts such as:
+    # The Office (2005)/Season 01/01.mkv
+    stem = Path(filepath).stem
+    episode_only = re.fullmatch(
+        r"(?i)(?:e|ep|episode)?[ ._-]*(\d{1,3})",
+        stem.strip(),
+    )
+    if (
+        episode_only
+        and hints["folder_season"] is not None
+        and hints["folder_title"]
+    ):
+        episode = int(episode_only.group(1))
+        return {
+            "type": "TV",
+            "title": hints["folder_title"],
+            "season": hints["folder_season"],
+            "episode": episode,
+            "episodes": [episode],
+            "year": hints["folder_year"],
+            "country_hint": hints["folder_country_hint"],
+            "folder_title": hints["folder_title"],
+            "folder_year": hints["folder_year"],
+            "folder_season": hints["folder_season"],
+            "folder_country_hint": hints["folder_country_hint"],
+        }
+
+    return parsed

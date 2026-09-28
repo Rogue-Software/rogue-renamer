@@ -40,6 +40,7 @@ from app.parser import (
     MEDIA_EXTENSIONS,
     companion_suffix,
     parse_filename,
+    parse_media_path,
     split_companion_filename,
 )
 from app.settings import (
@@ -1315,6 +1316,17 @@ class RogueRenamer(QMainWindow):
             clear_button
         )
 
+        self.scan_subfolders_checkbox = QCheckBox(
+            "Scan Subfolders"
+        )
+        self.scan_subfolders_checkbox.setChecked(True)
+        self.scan_subfolders_checkbox.setToolTip(
+            "When enabled, folder scans include media inside all nested folders."
+        )
+        controls.addWidget(
+            self.scan_subfolders_checkbox
+        )
+
         controls.addStretch()
 
         layout.addLayout(controls)
@@ -1881,19 +1893,27 @@ class RogueRenamer(QMainWindow):
             )
 
     def scan_folder(self, folder):
-        for path in Path(
-            folder
-        ).rglob("*"):
+        root = Path(folder)
+        if not root.exists() or not root.is_dir():
+            return 0
 
+        iterator = (
+            root.rglob("*")
+            if self.scan_subfolders_checkbox.isChecked()
+            else root.glob("*")
+        )
+
+        before = len(self.loaded_files)
+
+        for path in iterator:
             if (
                 path.is_file()
-                and
-                path.suffix.lower()
-                in MEDIA_EXTENSIONS
+                and path.suffix.lower() in MEDIA_EXTENSIONS
             ):
-                self.add_file(
-                    str(path)
-                )
+                self.add_file(str(path))
+
+        return len(self.loaded_files) - before
+
 
     def add_file(self, filepath):
         filepath = os.path.abspath(
@@ -1911,7 +1931,7 @@ class RogueRenamer(QMainWindow):
         ):
             return
 
-        parsed = parse_filename(
+        parsed = parse_media_path(
             filepath
         )
 
@@ -1925,9 +1945,15 @@ class RogueRenamer(QMainWindow):
             row
         )
 
+        display_name = path.name
+        parent_name = path.parent.name
+        if parent_name:
+            display_name = f"{parent_name} / {path.name}"
+
         original = QTableWidgetItem(
-            path.name
+            display_name
         )
+        original.setToolTip(filepath)
 
         original.setData(
             Qt.ItemDataRole.UserRole,
@@ -1948,12 +1974,33 @@ class RogueRenamer(QMainWindow):
             ),
         )
 
+        parsed_title_item = QTableWidgetItem(
+            parsed["title"]
+        )
+
+        folder_hints = []
+        if parsed.get("folder_title"):
+            folder_hints.append(
+                f"Folder title: {parsed['folder_title']}"
+            )
+        if parsed.get("folder_year"):
+            folder_hints.append(
+                f"Folder year: {parsed['folder_year']}"
+            )
+        if parsed.get("folder_season") is not None:
+            folder_hints.append(
+                f"Folder season: {parsed['folder_season']}"
+            )
+
+        if folder_hints:
+            parsed_title_item.setToolTip(
+                "\n".join(folder_hints)
+            )
+
         self.table.setItem(
             row,
             2,
-            QTableWidgetItem(
-                parsed["title"]
-            ),
+            parsed_title_item,
         )
 
         if parsed["type"] == "TV":
@@ -2121,7 +2168,7 @@ class RogueRenamer(QMainWindow):
                     )
                 )
 
-                parsed = parse_filename(
+                parsed = parse_media_path(
                     filepath
                 )
 
@@ -2313,7 +2360,7 @@ class RogueRenamer(QMainWindow):
             Qt.ItemDataRole.UserRole
         )
 
-        parsed = parse_filename(filepath)
+        parsed = parse_media_path(filepath)
 
         dialog = MatchSelectionDialog(
             parsed,
