@@ -66,7 +66,7 @@ DEFAULT_MOVIE_TEMPLATE = "{title} ({year})"
 DEFAULT_TV_TEMPLATE = "{title} - S{season:02d}E{episode:02d} - {episode_title}"
 
 DEFAULT_MOVIE_FOLDER_TEMPLATE = "{title} ({year})"
-DEFAULT_TV_FOLDER_TEMPLATE = "{title}/Season {season:02d}"
+DEFAULT_TV_FOLDER_TEMPLATE = "{title} ({year})/Season {season:02d}"
 
 
 def get_organization_settings():
@@ -75,6 +75,14 @@ def get_organization_settings():
 
     return {
         "enabled": bool(organization.get("enabled", False)),
+        "movie_library_root": organization.get(
+            "movie_library_root",
+            "",
+        ),
+        "tv_library_root": organization.get(
+            "tv_library_root",
+            "",
+        ),
         "movie_folder_template": organization.get(
             "movie_folder_template",
             DEFAULT_MOVIE_FOLDER_TEMPLATE,
@@ -142,8 +150,18 @@ def build_destination_path(original_path, match, proposed_name):
             values,
         )
 
-    # Organize beneath the folder containing the selected source file.
-    return source.parent / relative_folder / proposed_name
+    root_value = (
+        organization["movie_library_root"]
+        if match["type"] == "Movie"
+        else organization["tv_library_root"]
+    )
+    root_value = str(root_value or "").strip()
+
+    # Backward-compatible fallback: if no library root is configured,
+    # organize beneath the source folder as older Rogue versions did.
+    root = Path(root_value).expanduser() if root_value else source.parent
+
+    return root / relative_folder / proposed_name
 
 
 def get_naming_templates():
@@ -277,9 +295,39 @@ class SettingsDialog(QDialog):
             "Rogue Renamer Settings"
         )
 
-        self.resize(780, 780)
+        self.resize(820, 860)
 
         self.config = load_config()
+
+        # Make unchecked checkboxes clearly visible in the dark UI.
+        self.setStyleSheet("""
+            QCheckBox {
+                spacing: 8px;
+            }
+
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+                border: 2px solid #8a949e;
+                border-radius: 4px;
+                background-color: #171a1d;
+            }
+
+            QCheckBox::indicator:hover {
+                border: 2px solid #c6d0da;
+                background-color: #22272c;
+            }
+
+            QCheckBox::indicator:checked {
+                border: 2px solid #2f9df4;
+                background-color: #1677c8;
+            }
+
+            QCheckBox::indicator:disabled {
+                border: 2px solid #555d65;
+                background-color: #202428;
+            }
+        """)
 
         layout = QVBoxLayout(self)
 
@@ -390,8 +438,10 @@ class SettingsDialog(QDialog):
         layout.addWidget(self.organize_checkbox)
 
         organization_help = QLabel(
-            "When enabled, Rogue Renamer moves files into folders beneath "
-            "their current location. Use / to create nested folders.\n"
+            "When enabled, Rogue Renamer can move matched media into separate "
+            "Movies and TV library roots. Leave a root blank to keep the older "
+            "behavior of organizing beneath the source folder. Use / in folder "
+            "templates to create nested folders.\n"
             "Movie fields: {title}, {year}, {tmdb_id}\n"
             "TV fields: {title}, {year}, {season}, {episode}, {episodes}, "
             "{episode_code}, {episode_title}, {tmdb_id}"
@@ -401,6 +451,46 @@ class SettingsDialog(QDialog):
         layout.addWidget(organization_help)
 
         organization_form = QFormLayout()
+
+        self.movie_library_root_input = QLineEdit()
+        self.movie_library_root_input.setText(
+            organization.get("movie_library_root", "")
+        )
+        self.movie_library_root_input.setPlaceholderText(
+            r"Example: D:\Media\Movies"
+        )
+
+        movie_root_row = QHBoxLayout()
+        movie_root_row.addWidget(self.movie_library_root_input, 1)
+        movie_browse = QPushButton("Browse…")
+        movie_browse.clicked.connect(
+            lambda: self.choose_library_root(
+                self.movie_library_root_input,
+                "Select Movies Library",
+            )
+        )
+        movie_root_row.addWidget(movie_browse)
+        organization_form.addRow("Movies library:", movie_root_row)
+
+        self.tv_library_root_input = QLineEdit()
+        self.tv_library_root_input.setText(
+            organization.get("tv_library_root", "")
+        )
+        self.tv_library_root_input.setPlaceholderText(
+            r"Example: D:\Media\TV"
+        )
+
+        tv_root_row = QHBoxLayout()
+        tv_root_row.addWidget(self.tv_library_root_input, 1)
+        tv_browse = QPushButton("Browse…")
+        tv_browse.clicked.connect(
+            lambda: self.choose_library_root(
+                self.tv_library_root_input,
+                "Select TV Library",
+            )
+        )
+        tv_root_row.addWidget(tv_browse)
+        organization_form.addRow("TV library:", tv_root_row)
 
         self.movie_folder_input = QLineEdit()
         self.movie_folder_input.setText(
@@ -506,6 +596,18 @@ class SettingsDialog(QDialog):
         buttons.addWidget(save_button)
 
         layout.addLayout(buttons)
+
+    def choose_library_root(self, line_edit, title):
+        current = line_edit.text().strip()
+        start = current if current and Path(current).exists() else ""
+
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            title,
+            start,
+        )
+        if folder:
+            line_edit.setText(folder)
 
     def test_connection(self):
         token = (
@@ -645,6 +747,8 @@ class SettingsDialog(QDialog):
 
         self.config["organization"] = {
             "enabled": self.organize_checkbox.isChecked(),
+            "movie_library_root": self.movie_library_root_input.text().strip(),
+            "tv_library_root": self.tv_library_root_input.text().strip(),
             "movie_folder_template": movie_folder_template,
             "tv_folder_template": tv_folder_template,
         }
@@ -948,8 +1052,14 @@ class RenameConfirmationDialog(QDialog):
 
         layout = QVBoxLayout(self)
 
+        moving = any(
+            item["source"].parent != item["destination"].parent
+            for item in plan
+        )
+        action_word = "Move / Rename" if moving else "Rename"
+
         heading = QLabel(
-            f"Rename {len(plan)} file"
+            f"{action_word} {len(plan)} file"
             f"{'s' if len(plan) != 1 else ''}?"
         )
         heading.setStyleSheet(
@@ -958,7 +1068,8 @@ class RenameConfirmationDialog(QDialog):
         layout.addWidget(heading)
 
         explanation = QLabel(
-            "Review the complete rename plan below. "
+            "Review every source and destination below before continuing. "
+            "Files may be moved into your configured library folders. "
             "No existing files will be overwritten."
         )
         explanation.setWordWrap(True)
@@ -989,8 +1100,9 @@ class RenameConfirmationDialog(QDialog):
                 else "VIDEO"
             )
             preview_lines.append(
-                f"{index}. [{label}] {item['source']}\n"
-                f"   → {item['destination']}"
+                f"{index}. [{label}]\n"
+                f"   FROM: {item['source']}\n"
+                f"   TO:   {item['destination']}"
             )
 
         self.preview.setPlainText(
@@ -1012,7 +1124,9 @@ class RenameConfirmationDialog(QDialog):
         cancel_button = QPushButton("Cancel")
         cancel_button.clicked.connect(self.reject)
 
-        rename_button = QPushButton("Rename Files")
+        rename_button = QPushButton(
+            "Move / Rename Files" if moving else "Rename Files"
+        )
         rename_button.clicked.connect(self.accept)
         rename_button.setDefault(True)
 

@@ -17,8 +17,10 @@ DEFAULT_CONFIG = {
     },
     "organization": {
         "enabled": False,
+        "movie_library_root": "",
+        "tv_library_root": "",
         "movie_folder_template": "{title} ({year})",
-        "tv_folder_template": "{title}/Season {season:02d}",
+        "tv_folder_template": "{title} ({year})/Season {season:02d}",
     },
     "automation": {
         "auto_accept_threshold": 90,
