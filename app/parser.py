@@ -124,33 +124,86 @@ def parse_filename(filepath):
     path = Path(filepath)
     stem = path.stem
 
-    # S01E01
-    tv_match = re.search(
+    # S01E01, S01E01E02, S01E01-E02, S01E01.S01E02
+    first = re.search(
         r"(?i)(.*?)[ ._-]+S(\d{1,2})E(\d{1,3})",
         stem,
     )
 
-    if tv_match:
+    if first:
+        title = clean_title(first.group(1))
+        season = int(first.group(2))
+        episodes = [int(first.group(3))]
+
+        tail = stem[first.end():]
+
+        # Additional episodes may be E02 or S01E02. Stop naturally
+        # when release-info text begins.
+        for match in re.finditer(
+            r"(?i)(?:[ ._-]*)(?:S(\d{1,2}))?E(\d{1,3})",
+            tail,
+        ):
+            extra_season = (
+                int(match.group(1))
+                if match.group(1)
+                else season
+            )
+
+            if extra_season != season:
+                break
+
+            episode = int(match.group(2))
+            if episode not in episodes:
+                episodes.append(episode)
+
         return {
             "type": "TV",
-            "title": clean_title(tv_match.group(1)),
-            "season": int(tv_match.group(2)),
-            "episode": int(tv_match.group(3)),
+            "title": title,
+            "season": season,
+            "episode": episodes[0],
+            "episodes": episodes,
             "year": None,
         }
 
-    # 1x01
-    tv_match = re.search(
+    # 1x01, 1x01-1x02, 1x01x02
+    first = re.search(
         r"(?i)(.*?)[ ._-]+(\d{1,2})x(\d{1,3})",
         stem,
     )
 
-    if tv_match:
+    if first:
+        title = clean_title(first.group(1))
+        season = int(first.group(2))
+        episodes = [int(first.group(3))]
+        tail = stem[first.end():]
+
+        for match in re.finditer(
+            r"(?i)(?:[ ._-]*)(?:(\d{1,2})x)?(\d{1,3})",
+            tail,
+        ):
+            # Avoid treating ordinary release-info numbers as episodes.
+            token = match.group(0)
+            if "x" not in token.lower():
+                continue
+
+            extra_season = (
+                int(match.group(1))
+                if match.group(1)
+                else season
+            )
+            if extra_season != season:
+                break
+
+            episode = int(match.group(2))
+            if episode not in episodes:
+                episodes.append(episode)
+
         return {
             "type": "TV",
-            "title": clean_title(tv_match.group(1)),
-            "season": int(tv_match.group(2)),
-            "episode": int(tv_match.group(3)),
+            "title": title,
+            "season": season,
+            "episode": episodes[0],
+            "episodes": episodes,
             "year": None,
         }
 
@@ -166,6 +219,7 @@ def parse_filename(filepath):
             "title": clean_title(year_match.group(1)),
             "season": None,
             "episode": None,
+            "episodes": [],
             "year": int(year_match.group(2)),
         }
 
@@ -174,5 +228,7 @@ def parse_filename(filepath):
         "title": clean_title(stem),
         "season": None,
         "episode": None,
+        "episodes": [],
         "year": None,
     }
+

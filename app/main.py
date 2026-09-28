@@ -2,7 +2,8 @@ import os
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QByteArray
+from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -12,6 +13,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QFrame,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -122,6 +124,8 @@ def build_destination_path(original_path, match, proposed_name):
             "year": match.get("year") or "",
             "season": match.get("season") or 0,
             "episode": match.get("episode") or 0,
+            "episodes": format_episode_numbers(match),
+            "episode_code": format_episode_code(match),
             "episode_title": match.get("episode_title") or "",
             "tmdb_id": match.get("id") or "",
         }
@@ -154,6 +158,27 @@ def render_naming_template(template, values):
     return safe_filename(filename)
 
 
+
+def format_episode_code(match):
+    season = match.get("season") or 0
+    episodes = match.get("episodes") or [match.get("episode") or 0]
+
+    if len(episodes) == 1:
+        return f"S{season:02d}E{episodes[0]:02d}"
+
+    return (
+        f"S{season:02d}E{episodes[0]:02d}"
+        + "".join(f"-E{episode:02d}" for episode in episodes[1:])
+    )
+
+
+def format_episode_numbers(match):
+    episodes = match.get("episodes") or [match.get("episode") or 0]
+    if len(episodes) == 1:
+        return f"{episodes[0]:02d}"
+    return "-".join(f"{episode:02d}" for episode in episodes)
+
+
 def build_proposed_filename(
     original_path,
     match,
@@ -170,15 +195,32 @@ def build_proposed_filename(
         }
         filename = render_naming_template(movie_template, values)
     else:
+        episodes = match.get("episodes") or [match.get("episode") or 0]
         values = {
             "title": match.get("title", ""),
             "year": match.get("year") or "",
             "season": match.get("season") or 0,
             "episode": match.get("episode") or 0,
+            "episodes": format_episode_numbers(match),
+            "episode_code": format_episode_code(match),
             "episode_title": match.get("episode_title") or "",
             "tmdb_id": match.get("id") or "",
         }
-        filename = render_naming_template(tv_template, values)
+
+        # Preserve the user's existing preset for single episodes. For
+        # multi-episode files, make the stock preset produce an unambiguous
+        # S01E01-E02 style name automatically.
+        if (
+            len(episodes) > 1
+            and tv_template == DEFAULT_TV_TEMPLATE
+        ):
+            filename = (
+                f"{values['title']} - {values['episode_code']} - "
+                f"{values['episode_title']}"
+            )
+            filename = render_naming_template(filename, values)
+        else:
+            filename = render_naming_template(tv_template, values)
 
     return filename + extension
 
@@ -297,8 +339,8 @@ class SettingsDialog(QDialog):
 
         naming_help = QLabel(
             "Movie fields: {title}, {year}, {tmdb_id}\n"
-            "TV fields: {title}, {year}, {season}, {episode}, "
-            "{episode_title}, {tmdb_id}\n"
+            "TV fields: {title}, {year}, {season}, {episode}, {episodes}, "
+            "{episode_code}, {episode_title}, {tmdb_id}\n"
             "Formatting such as {season:02d} and {episode:02d} is supported."
         )
         naming_help.setWordWrap(True)
@@ -343,8 +385,8 @@ class SettingsDialog(QDialog):
             "When enabled, Rogue Renamer moves files into folders beneath "
             "their current location. Use / to create nested folders.\n"
             "Movie fields: {title}, {year}, {tmdb_id}\n"
-            "TV fields: {title}, {year}, {season}, {episode}, "
-            "{episode_title}, {tmdb_id}"
+            "TV fields: {title}, {year}, {season}, {episode}, {episodes}, "
+            "{episode_code}, {episode_title}, {tmdb_id}"
         )
         organization_help.setWordWrap(True)
         organization_help.setStyleSheet("color: #aaaaaa;")
@@ -497,6 +539,8 @@ class SettingsDialog(QDialog):
                     "year": 2026,
                     "season": 2,
                     "episode": 3,
+                    "episodes": "03-04",
+                    "episode_code": "S02E03-E04",
                     "episode_title": "Example Episode",
                     "tmdb_id": 67890,
                 },
@@ -539,6 +583,8 @@ class SettingsDialog(QDialog):
                     "year": 2026,
                     "season": 2,
                     "episode": 3,
+                    "episodes": "03-04",
+                    "episode_code": "S02E03-E04",
                     "episode_title": "Example Episode",
                     "tmdb_id": 67890,
                 },
@@ -565,178 +611,253 @@ class SettingsDialog(QDialog):
 class MatchSelectionDialog(QDialog):
     def __init__(self, parsed, candidates, parent=None):
         super().__init__(parent)
-
         self.parsed = parsed
         self.candidates = candidates
         self.selected_match = None
+        self.poster_cache = {}
 
-        self.setWindowTitle(
-            f"Choose Match — {parsed['title']}"
-        )
-        self.resize(760, 520)
+        self.setWindowTitle(f"Choose Match — {parsed['title']}")
+        self.resize(1040, 700)
+        self.setMinimumSize(850, 580)
 
         layout = QVBoxLayout(self)
 
-        heading = QLabel(
-            f"Choose the correct match for “{parsed['title']}”"
-        )
-        heading.setStyleSheet(
-            "font-size: 20px; font-weight: bold;"
-        )
+        heading = QLabel(f"Choose the correct match for “{parsed['title']}”")
+        heading.setStyleSheet("font-size: 20px; font-weight: bold;")
         layout.addWidget(heading)
 
+        requested = ""
+        if parsed.get("type") == "TV":
+            requested = f" • Requested: {format_episode_code(parsed)}"
         explanation = QLabel(
-            "Rogue Renamer found possible metadata matches. "
-            "Select the correct title below."
+            "Rogue Renamer found possible metadata matches"
+            f"{requested}. Select a title to inspect its details."
         )
         explanation.setWordWrap(True)
         layout.addWidget(explanation)
 
+        content = QHBoxLayout()
+
         self.list_widget = QListWidget()
-        self.list_widget.setStyleSheet(
-            """
-            QListWidget {
-                background: #1d2024;
-                color: #eeeeee;
-                border: 1px solid #444;
-                padding: 4px;
-            }
-            QListWidget::item {
-                color: #eeeeee;
-                background: #1d2024;
-                padding: 9px 7px;
-                border-bottom: 1px solid #30343a;
-            }
-            QListWidget::item:selected {
-                color: #ffffff;
-                background: #3b4654;
-            }
-            QListWidget::item:hover {
-                background: #2b3036;
-            }
-            """
-        )
+        self.list_widget.setMinimumWidth(455)
+        self.list_widget.setStyleSheet("""
+            QListWidget { background:#1d2024; color:#eee; border:1px solid #444; padding:4px; }
+            QListWidget::item { color:#eee; background:#1d2024; padding:12px 8px;
+                                border-bottom:1px solid #30343a; }
+            QListWidget::item:selected { color:#fff; background:#3b4654; }
+            QListWidget::item:hover { background:#2b3036; }
+        """)
 
         for candidate in candidates:
             year = candidate.get("year") or "Unknown year"
             score = candidate.get("score", 0)
             title = candidate.get("title", "Unknown")
+            countries = candidate.get("origin_country") or []
+            country_text = f" • {', '.join(countries)}" if countries else ""
 
             if candidate["type"] == "TV":
-                episode_title = candidate.get("episode_title")
-
-                if episode_title:
-                    detail = (
-                        f"{title} ({year})   •   "
-                        f"S{candidate['season']:02d}"
-                        f"E{candidate['episode']:02d} exists"
-                        f"   •   Match score {score}"
-                    )
-                else:
-                    detail = (
-                        f"{title} ({year})   •   "
-                        f"Requested episode not found"
-                        f"   •   Match score {score}"
-                    )
+                state = (
+                    format_episode_code(candidate)
+                    if candidate.get("episode_title")
+                    else "episode(s) missing"
+                )
+                detail = (
+                    f"{title} ({year}){country_text}\\n"
+                    f"TMDB #{candidate.get('id', '?')}   •   {state}   •   Score {score}"
+                )
             else:
                 detail = (
-                    f"{title} ({year})"
-                    f"   •   Match score {score}"
+                    f"{title} ({year}){country_text}\\n"
+                    f"TMDB #{candidate.get('id', '?')}   •   Score {score}"
                 )
 
             item = QListWidgetItem(detail)
-            item.setData(
-                Qt.ItemDataRole.UserRole,
-                candidate,
-            )
+            item.setData(Qt.ItemDataRole.UserRole, candidate)
             self.list_widget.addItem(item)
 
-        layout.addWidget(self.list_widget)
+        content.addWidget(self.list_widget, 5)
+
+        details_frame = QFrame()
+        details_frame.setStyleSheet("""
+            QFrame { background:#1d2024; border:1px solid #444; }
+            QLabel { border:none; background:transparent; }
+        """)
+        details_layout = QVBoxLayout(details_frame)
+
+        top = QHBoxLayout()
+        self.poster = QLabel("No poster")
+        self.poster.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.poster.setFixedSize(180, 270)
+        self.poster.setStyleSheet(
+            "background:#15171a; border:1px solid #444; color:#888;"
+        )
+        top.addWidget(self.poster)
+
+        meta_layout = QVBoxLayout()
+        self.detail_title = QLabel()
+        self.detail_title.setWordWrap(True)
+        self.detail_title.setStyleSheet("font-size:20px; font-weight:bold;")
+        meta_layout.addWidget(self.detail_title)
+
+        self.detail_meta = QLabel()
+        self.detail_meta.setWordWrap(True)
+        self.detail_meta.setTextFormat(Qt.TextFormat.RichText)
+        meta_layout.addWidget(self.detail_meta)
+
+        self.episodes_label = QLabel()
+        self.episodes_label.setWordWrap(True)
+        self.episodes_label.setTextFormat(Qt.TextFormat.RichText)
+        self.episodes_label.setStyleSheet("margin-top:8px;")
+        meta_layout.addWidget(self.episodes_label)
+        meta_layout.addStretch()
+        top.addLayout(meta_layout, 1)
+        details_layout.addLayout(top)
+
+        overview_heading = QLabel("Overview")
+        overview_heading.setStyleSheet("font-weight:bold; margin-top:8px;")
+        details_layout.addWidget(overview_heading)
 
         self.overview = QTextEdit()
         self.overview.setReadOnly(True)
-        self.overview.setMaximumHeight(140)
-        self.overview.setStyleSheet(
-            """
-            QTextEdit {
-                background: #1d2024;
-                color: #dddddd;
-                border: 1px solid #444;
-                padding: 7px;
-                selection-background-color: #3b4654;
-                selection-color: #ffffff;
-            }
-            """
-        )
-        layout.addWidget(self.overview)
+        self.overview.setStyleSheet("""
+            QTextEdit { background:#15171a; color:#ddd; border:1px solid #444; padding:7px; }
+        """)
+        details_layout.addWidget(self.overview, 1)
 
-        self.list_widget.currentItemChanged.connect(
-            self.update_overview
-        )
-        self.list_widget.itemDoubleClicked.connect(
-            lambda _item: self.use_selected()
-        )
+        content.addWidget(details_frame, 6)
+        layout.addLayout(content, 1)
+
+        self.list_widget.currentItemChanged.connect(self.update_overview)
+        self.list_widget.itemDoubleClicked.connect(lambda _item: self.use_selected())
 
         buttons = QHBoxLayout()
-
+        buttons.addStretch()
         cancel_button = QPushButton("Cancel")
         cancel_button.clicked.connect(self.reject)
-
         use_button = QPushButton("Use Selected Match")
         use_button.clicked.connect(self.use_selected)
-
-        buttons.addStretch()
+        use_button.setDefault(True)
         buttons.addWidget(cancel_button)
         buttons.addWidget(use_button)
-
         layout.addLayout(buttons)
 
         if self.list_widget.count():
             self.list_widget.setCurrentRow(0)
 
-    def update_overview(self, current, previous):
-        if not current:
-            self.overview.clear()
+    def load_poster(self, candidate):
+        poster_path = candidate.get("poster_path")
+        if not poster_path:
+            self.poster.setPixmap(QPixmap())
+            self.poster.setText("No poster available")
             return
 
-        candidate = current.data(
-            Qt.ItemDataRole.UserRole
+        pixmap = self.poster_cache.get(poster_path)
+        if pixmap is None:
+            self.poster.setPixmap(QPixmap())
+            self.poster.setText("Loading poster…")
+            QApplication.processEvents()
+            try:
+                response = requests.get(
+                    f"https://image.tmdb.org/t/p/w342{poster_path}",
+                    timeout=8,
+                )
+                response.raise_for_status()
+                pixmap = QPixmap()
+                if not pixmap.loadFromData(QByteArray(response.content)):
+                    pixmap = None
+                if pixmap is not None:
+                    self.poster_cache[poster_path] = pixmap
+            except requests.RequestException:
+                pixmap = None
+
+        if pixmap is None:
+            self.poster.setPixmap(QPixmap())
+            self.poster.setText("Poster unavailable")
+            return
+
+        self.poster.setText("")
+        self.poster.setPixmap(
+            pixmap.scaled(
+                self.poster.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
         )
 
-        overview = candidate.get(
-            "overview",
-            "",
+    def update_overview(self, current, previous):
+        if not current:
+            return
+
+        candidate = current.data(Qt.ItemDataRole.UserRole)
+        title = candidate.get("title", "Unknown")
+        original_title = candidate.get("original_title") or ""
+        year = candidate.get("year") or "Unknown"
+        tmdb_id = candidate.get("id", "?")
+        score = candidate.get("score", 0)
+        language = (candidate.get("original_language") or "Unknown").upper()
+        countries = candidate.get("origin_country") or []
+        country_text = ", ".join(countries) if countries else "Unknown"
+
+        self.detail_title.setText(f"{title} ({year})")
+
+        date_value = (
+            candidate.get("first_air_date")
+            if candidate.get("type") == "TV"
+            else candidate.get("release_date")
+        ) or "Unknown"
+        date_label = "First aired" if candidate.get("type") == "TV" else "Release date"
+
+        original_line = ""
+        if original_title and original_title.casefold() != title.casefold():
+            original_line = f"<br><b>Original title:</b> {original_title}"
+
+        self.detail_meta.setText(
+            f"<b>TMDB ID:</b> {tmdb_id}<br>"
+            f"<b>{date_label}:</b> {date_value}<br>"
+            f"<b>Country:</b> {country_text}<br>"
+            f"<b>Original language:</b> {language}<br>"
+            f"<b>Match score:</b> {score}/100"
+            f"{original_line}"
         )
 
-        if not overview:
-            overview = "No description available."
+        if candidate.get("type") == "TV":
+            details = candidate.get("episode_details") or []
+            lines = ["<b>Requested episodes:</b>"]
+            if details:
+                for ep in details:
+                    number = ep.get("episode", 0)
+                    name = ep.get("name") or "Untitled"
+                    air = ep.get("air_date") or "Unknown air date"
+                    lines.append(
+                        f"S{candidate.get('season', 0):02d}E{number:02d} — "
+                        f"{name} <span style='color:#aaa'>({air})</span>"
+                    )
+            else:
+                for number in candidate.get("missing_episodes") or candidate.get("episodes") or []:
+                    lines.append(
+                        f"S{candidate.get('season', 0):02d}E{number:02d} — Not found"
+                    )
+            self.episodes_label.setText("<br>".join(lines))
+        else:
+            self.episodes_label.setText("<b>Type:</b> Movie")
 
-        self.overview.setPlainText(overview)
+        self.overview.setPlainText(
+            candidate.get("overview") or "No description available."
+        )
+        self.load_poster(candidate)
 
     def use_selected(self):
         item = self.list_widget.currentItem()
-
         if not item:
-            QMessageBox.warning(
-                self,
-                "Choose Match",
-                "Select a match first.",
-            )
+            QMessageBox.warning(self, "Choose Match", "Select a match first.")
             return
 
-        candidate = item.data(
-            Qt.ItemDataRole.UserRole
-        )
-
-        if (
-            candidate["type"] == "TV"
-            and not candidate.get("episode_title")
-        ):
+        candidate = item.data(Qt.ItemDataRole.UserRole)
+        if candidate["type"] == "TV" and not candidate.get("episode_title"):
             QMessageBox.warning(
                 self,
                 "Episode Not Found",
-                "The requested season and episode "
-                "does not exist for this show.",
+                "One or more requested episodes do not exist for this show and season.",
             )
             return
 
@@ -1276,10 +1397,7 @@ class RogueRenamer(QMainWindow):
         )
 
         if parsed["type"] == "TV":
-            se = (
-                f"S{parsed['season']:02d}"
-                f"E{parsed['episode']:02d}"
-            )
+            se = format_episode_code(parsed)
         else:
             se = ""
 

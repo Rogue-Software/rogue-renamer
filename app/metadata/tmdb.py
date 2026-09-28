@@ -264,6 +264,10 @@ def search_movie_candidates(parsed):
                     result.get(
                         "poster_path"
                     ),
+                "release_date": result.get("release_date"),
+                "original_language": result.get("original_language", ""),
+                "origin_country": result.get("origin_country", []),
+                "popularity": result.get("popularity", 0),
                 "score": score,
             }
         )
@@ -286,60 +290,50 @@ def search_tv_candidates(parsed):
     )
 
     candidates = []
+    requested_episodes = (
+        parsed.get("episodes")
+        or [parsed["episode"]]
+    )
 
-    for result in data.get(
-        "results",
-        []
-    )[:10]:
+    for result in data.get("results", [])[:10]:
+        score = score_tv_candidate(parsed, result)
+        episode_details = []
+        missing_episodes = []
 
-        score = score_tv_candidate(
-            parsed,
-            result,
-        )
+        for episode_number in requested_episodes:
+            try:
+                episode_data = request_tmdb(
+                    f"/tv/{result['id']}"
+                    f"/season/{parsed['season']}"
+                    f"/episode/{episode_number}"
+                )
 
-        # Verify that the requested
-        # episode actually exists.
-        episode = None
+                episode_details.append(
+                    {
+                        "id": episode_data.get("id"),
+                        "episode": episode_number,
+                        "name": episode_data.get(
+                            "name",
+                            f"Episode {episode_number}",
+                        ),
+                        "air_date": episode_data.get("air_date"),
+                    }
+                )
 
-        try:
-            episode_data = request_tmdb(
-                f"/tv/{result['id']}"
-                f"/season/{parsed['season']}"
-                f"/episode/{parsed['episode']}"
-            )
+            except TMDBError:
+                missing_episodes.append(episode_number)
 
-            episode = {
-                "id":
-                    episode_data.get("id"),
+        if episode_details and not missing_episodes:
+            score = min(100, score + 5)
+        elif missing_episodes:
+            # A multi-episode candidate is only valid if every requested
+            # episode exists for the same show and season.
+            score = max(0, score - 40)
 
-                "name":
-                    episode_data.get(
-                        "name",
-                        f"Episode "
-                        f"{parsed['episode']}",
-                    ),
-
-                "air_date":
-                    episode_data.get(
-                        "air_date"
-                    ),
-            }
-
-            # Existing requested episode
-            # is strong evidence.
-            score = min(
-                100,
-                score + 5,
-            )
-
-        except TMDBError:
-            # If SxxExx doesn't exist for
-            # this candidate, heavily
-            # penalize it.
-            score = max(
-                0,
-                score - 40,
-            )
+        episode_titles = [
+            item["name"]
+            for item in episode_details
+        ]
 
         candidates.append(
             {
@@ -349,35 +343,30 @@ def search_tv_candidates(parsed):
                     "name",
                     parsed["title"],
                 ),
-                "original_title":
-                    result.get(
-                        "original_name",
-                        "",
-                    ),
-                "year": year_from_date(
-                    result.get(
-                        "first_air_date"
-                    )
+                "original_title": result.get(
+                    "original_name",
+                    "",
                 ),
-                "overview":
-                    result.get(
-                        "overview",
-                        "",
-                    ),
-                "poster_path":
-                    result.get(
-                        "poster_path"
-                    ),
-                "season":
-                    parsed["season"],
-                "episode":
-                    parsed["episode"],
-                "episode_title":
-                    (
-                        episode["name"]
-                        if episode
-                        else None
-                    ),
+                "year": year_from_date(
+                    result.get("first_air_date")
+                ),
+                "overview": result.get("overview", ""),
+                "poster_path": result.get("poster_path"),
+                "first_air_date": result.get("first_air_date"),
+                "original_language": result.get("original_language", ""),
+                "origin_country": result.get("origin_country", []),
+                "popularity": result.get("popularity", 0),
+                "season": parsed["season"],
+                "episode": requested_episodes[0],
+                "episodes": requested_episodes.copy(),
+                "episode_title": (
+                    " + ".join(episode_titles)
+                    if episode_titles and not missing_episodes
+                    else None
+                ),
+                "episode_titles": episode_titles,
+                "episode_details": episode_details,
+                "missing_episodes": missing_episodes,
                 "score": score,
             }
         )
