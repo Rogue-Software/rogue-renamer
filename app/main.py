@@ -9,7 +9,7 @@ import json
 import shutil
 
 from PySide6.QtCore import Qt, QByteArray, QObject, QThread, Signal, QUrl
-from PySide6.QtGui import QPixmap, QDesktopServices
+from PySide6.QtGui import QPixmap, QDesktopServices, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -70,6 +70,21 @@ from app.settings import (
     load_rename_history,
     save_rename_history,
 )
+
+def app_asset_path(*parts):
+    """Resolve bundled assets in source runs and future PyInstaller builds."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        base = Path(sys._MEIPASS)
+    else:
+        # main.py lives in app/, while assets/ lives at the project root.
+        base = Path(__file__).resolve().parent.parent
+    return base.joinpath(*parts)
+
+
+def rogue_app_icon():
+    path = app_asset_path("assets", "rogue_renamer.png")
+    return QIcon(str(path)) if path.exists() else QIcon()
+
 
 
 def safe_filename(text):
@@ -426,9 +441,27 @@ class FirstRunSetupDialog(QDialog):
 
         outer = QVBoxLayout(self)
 
+        welcome_row = QHBoxLayout()
+        welcome_logo = QLabel()
+        welcome_logo_path = app_asset_path("assets", "rogue_renamer.png")
+        if welcome_logo_path.exists():
+            welcome_pixmap = QPixmap(str(welcome_logo_path))
+            if not welcome_pixmap.isNull():
+                welcome_logo.setPixmap(
+                    welcome_pixmap.scaled(
+                        54, 54,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                )
+        welcome_logo.setFixedSize(58, 58)
+
         title = QLabel("Welcome to Rogue Renamer")
         title.setStyleSheet("font-size:28px; font-weight:bold;")
-        outer.addWidget(title)
+        welcome_row.addWidget(welcome_logo)
+        welcome_row.addWidget(title)
+        welcome_row.addStretch()
+        outer.addLayout(welcome_row)
 
         subtitle = QLabel(
             "Let's set up your metadata providers. Your API credentials stay "
@@ -3238,21 +3271,44 @@ class RogueRenamer(QMainWindow):
 
         titles = QVBoxLayout()
 
-        app_title = QLabel(
+        brand_row = QHBoxLayout()
+
+        self.brand_logo = QLabel()
+        logo_path = app_asset_path("assets", "rogue_renamer.png")
+        if logo_path.exists():
+            logo_pixmap = QPixmap(str(logo_path))
+            if not logo_pixmap.isNull():
+                self.brand_logo.setPixmap(
+                    logo_pixmap.scaled(
+                        44, 44,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                )
+        self.brand_logo.setFixedSize(48, 48)
+        self.brand_logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.app_title = QLabel(
             "ROGUE RENAMER"
         )
 
-        app_title.setStyleSheet(
+        self.app_title.setStyleSheet(
             "font-size: 30px; "
             "font-weight: bold;"
         )
 
-        subtitle = QLabel(
+        self.subtitle = QLabel(
             "Movie & TV metadata renaming"
         )
 
-        titles.addWidget(app_title)
-        titles.addWidget(subtitle)
+        title_text = QVBoxLayout()
+        title_text.setSpacing(1)
+        title_text.addWidget(self.app_title)
+        title_text.addWidget(self.subtitle)
+
+        brand_row.addWidget(self.brand_logo)
+        brand_row.addLayout(title_text)
+        titles.addLayout(brand_row)
 
         settings_button = QPushButton(
             "⚙ Settings"
@@ -3270,6 +3326,7 @@ class RogueRenamer(QMainWindow):
         )
 
         self.mode_button = QPushButton()
+        self.mode_button.setObjectName("modeAction")
         self.mode_button.clicked.connect(self.toggle_mode)
 
         header.addLayout(titles)
@@ -3307,6 +3364,7 @@ class RogueRenamer(QMainWindow):
         clear_button = QPushButton(
             "Clear"
         )
+        clear_button.setObjectName("secondaryAction")
 
         clear_button.clicked.connect(
             self.clear_files
@@ -3403,23 +3461,24 @@ class RogueRenamer(QMainWindow):
 
         # DROP AREA
 
-        drop = QLabel(
+        self.drop_area = QLabel(
             "Drop movies, TV episodes, "
             "or folders here"
         )
 
-        drop.setAlignment(
+        self.drop_area.setAlignment(
             Qt.AlignmentFlag.AlignCenter
         )
 
-        drop.setMinimumHeight(60)
+        self.drop_area.setMinimumHeight(60)
 
-        drop.setStyleSheet(
+        self.drop_area.setStyleSheet(
             "border: 2px dashed #555;"
+            "border-radius: 6px;"
             "color: #aaa;"
         )
 
-        layout.addWidget(drop)
+        layout.addWidget(self.drop_area)
 
         # TABLE
 
@@ -3514,6 +3573,53 @@ class RogueRenamer(QMainWindow):
             self.review_match
         )
 
+        self.basic_steps = QFrame()
+        steps_layout = QHBoxLayout(self.basic_steps)
+        steps_layout.setContentsMargins(0, 0, 0, 4)
+        steps_layout.setSpacing(8)
+
+        self.step_labels = []
+        for number, label in (
+            ("1", "ADD"),
+            ("2", "MATCH"),
+            ("3", "REVIEW"),
+            ("4", "RENAME"),
+        ):
+            step = QLabel(f"{number}  {label}")
+            step.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            step.setMinimumHeight(34)
+            steps_layout.addWidget(step, 1)
+            self.step_labels.append(step)
+
+        layout.addWidget(self.basic_steps)
+
+        self.basic_safety = QLabel(
+            "BASIC MODE  •  Rename in place  •  Files are never moved"
+        )
+        self.basic_safety.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.basic_safety.setMinimumHeight(28)
+        self.basic_safety.setStyleSheet(
+            "background:#121d25; color:#8fc8ed; border:1px solid #315b77; "
+            "border-radius:4px; padding:4px 10px; font-size:11px; font-weight:600;"
+        )
+        layout.addWidget(self.basic_safety)
+
+        self.workflow_bar = QFrame()
+        self.workflow_bar.setObjectName("workflowBar")
+        workflow_layout = QHBoxLayout(self.workflow_bar)
+        workflow_layout.setContentsMargins(12, 7, 12, 7)
+
+        self.workflow_title = QLabel("RENAME PREVIEW")
+        self.workflow_title.setObjectName("workflowTitle")
+        self.workflow_summary = QLabel("No files loaded")
+        self.workflow_summary.setObjectName("workflowSummary")
+
+        workflow_layout.addWidget(self.workflow_title)
+        workflow_layout.addStretch()
+        workflow_layout.addWidget(self.workflow_summary)
+
+        layout.addWidget(self.workflow_bar)
+
         layout.addWidget(
             self.table
         )
@@ -3525,10 +3631,12 @@ class RogueRenamer(QMainWindow):
         self.status_label = QLabel(
             "0 files loaded"
         )
+        self.status_label.setObjectName("batchStatus")
 
         self.search_button = QPushButton(
             "Search Metadata"
         )
+        self.search_button.setObjectName("matchAction")
 
         self.search_button.setEnabled(
             False
@@ -3537,10 +3645,16 @@ class RogueRenamer(QMainWindow):
         self.search_button.clicked.connect(
             self.search_metadata
         )
+        self.search_button.setStyleSheet(
+            "QPushButton { background:#202a32; color:#cbe8fb; border:1px solid #477b9f; "
+            "border-radius:5px; padding:9px 16px; font-weight:bold; }"
+            "QPushButton:hover { background:#293946; border-color:#6db3df; }"
+        )
 
         self.review_button = QPushButton(
             "Review Matches"
         )
+        self.review_button.setObjectName("reviewAction")
         self.review_button.setEnabled(False)
         self.review_button.clicked.connect(
             self.review_next_match
@@ -3549,6 +3663,7 @@ class RogueRenamer(QMainWindow):
         self.rename_button = QPushButton(
             "Rename Files"
         )
+        self.rename_button.setObjectName("primaryAction")
 
         self.rename_button.setEnabled(
             False
@@ -3567,6 +3682,7 @@ class RogueRenamer(QMainWindow):
         self.undo_button = QPushButton(
             "Undo Last Rename"
         )
+        self.undo_button.setObjectName("undoAction")
         self.undo_button.setEnabled(
             bool(self.last_rename_batch)
         )
@@ -3650,9 +3766,32 @@ class RogueRenamer(QMainWindow):
             }
 
             QHeaderView::section {
-                background: #292d32;
+                background: #20262b;
+                color: #cbd8e1;
+                border: none;
+                border-right: 1px solid #39434c;
+                border-bottom: 1px solid #4b5964;
                 padding: 8px;
                 font-weight: bold;
+            }
+
+            QTableWidget {
+                background: #15191d;
+                alternate-background-color: #191e23;
+                color: #e6edf2;
+                border: 1px solid #39434c;
+                gridline-color: #303941;
+                selection-background-color: #334d61;
+                selection-color: #ffffff;
+            }
+
+            QTableWidget::item {
+                padding: 7px 6px;
+            }
+
+            QTableWidget::item:selected {
+                background: #334d61;
+                color: #ffffff;
             }
             """
         )
@@ -3970,21 +4109,171 @@ class RogueRenamer(QMainWindow):
         dialog = LibraryAuditDialog(folder, [], self)
         dialog.exec()
 
+    def update_workflow_summary(self):
+        total = self.table.rowCount()
+        ready = review = failed = pending = 0
+
+        for row in range(total):
+            status_item = self.table.item(row, 7)
+            status = status_item.text() if status_item else ""
+
+            if "No Match" in status or "Error:" in status:
+                failed += 1
+            elif self.row_needs_review(row):
+                review += 1
+            elif "Ready to Search" in status or "Searching" in status:
+                pending += 1
+            elif self.row_is_safe_to_rename(row) or "Renamed" in status:
+                ready += 1
+            else:
+                pending += 1
+
+        if not total:
+            self.workflow_summary.setText("No files loaded")
+            active = 0
+            completed = set()
+        else:
+            parts = [f"{total} file{'s' if total != 1 else ''}"]
+            if ready:
+                parts.append(f"{ready} ready")
+            if review:
+                parts.append(f"{review} need review")
+            if failed:
+                parts.append(f"{failed} failed")
+            if pending:
+                parts.append(f"{pending} pending")
+            self.workflow_summary.setText("  •  ".join(parts))
+
+            if pending:
+                active = 1
+                completed = {0}
+            elif review or failed:
+                active = 2
+                completed = {0, 1}
+            elif ready:
+                active = 3
+                completed = {0, 1, 2}
+            else:
+                active = 1
+                completed = {0}
+
+        for index, step in enumerate(self.step_labels):
+            if index in completed:
+                style = (
+                    "background:#1b3b2b; color:#bce8ca; "
+                    "border:1px solid #3f7f5a;"
+                )
+            elif index == active:
+                style = (
+                    "background:#17364d; color:#d7efff; "
+                    "border:1px solid #4d9bd3;"
+                )
+            else:
+                style = (
+                    "background:#181d21; color:#78848e; "
+                    "border:1px solid #343d45;"
+                )
+            step.setStyleSheet(
+                style
+                + "border-radius:4px; padding:5px 10px; "
+                  "font-weight:bold; letter-spacing:1px;"
+            )
+
+
     def apply_interface_mode(self):
         """Show the simple rename workflow or Rogue's complete toolset."""
         basic = self.current_mode == "basic"
 
-        # Basic keeps only the controls needed for add -> match -> review -> rename.
+        # Basic is intentionally a focused rename-in-place experience.
         self.history_button.setVisible(not basic)
         self.audit_button.setVisible(not basic)
         self.undo_button.setVisible(not basic)
 
+        # Keep the useful before/after information while hiding parser internals.
+        # 0 Original, 4 Metadata Match, 6 Proposed Filename, 7 Status remain visible.
+        for column in (1, 2, 3, 5):
+            self.table.setColumnHidden(column, basic)
+
         self.mode_button.setText(
-            "Switch to Advanced" if basic else "Switch to Basic"
+            "Advanced Mode" if basic else "Basic Mode"
         )
+        self.mode_button.setToolTip(
+            "Open Rogue's full toolset" if basic
+            else "Switch to the simple rename-in-place interface"
+        )
+
+        self.workflow_title.setText("RENAME PREVIEW" if basic else "MEDIA WORKSPACE")
+        self.basic_steps.setVisible(basic)
+        self.basic_safety.setVisible(basic)
+
+        if basic:
+            self.search_button.setText("Match Files")
+            self.search_button.setToolTip(
+                "Search the selected metadata provider and preview the new filenames."
+            )
+            self.review_button.setToolTip(
+                "Review files that need confirmation. You can also double click a match."
+            )
+            self.rename_button.setToolTip(
+                "Rename confirmed files in place. Basic mode does not move them."
+            )
+            basic_headers = {
+                0: "Original File",
+                4: "Metadata Match",
+                6: "New Filename",
+                7: "Status",
+            }
+            for column, label in basic_headers.items():
+                item = self.table.horizontalHeaderItem(column)
+                if item:
+                    item.setText(label)
+            self.subtitle.setText("Simple movie & TV rename-in-place")
+            self.drop_area.setText(
+                "Drop movies, TV episodes, or folders here\n"
+                "Rogue will identify them and preview the new filenames."
+            )
+            self.drop_area.setMinimumHeight(92)
+            self.drop_area.setStyleSheet(
+                "border: 2px dashed #4d7ea8;"
+                "border-radius: 8px;"
+                "color: #c8d7e5;"
+                "padding: 12px;"
+            )
+            self.rename_button.setStyleSheet(
+                "QPushButton { background:#1f6fa8; border:1px solid #4d9bd3; "
+                "font-weight:bold; padding:10px 22px; border-radius:4px; }"
+                "QPushButton:hover { background:#287fb9; }"
+                "QPushButton:disabled { background:#20252a; color:#666; "
+                "border:1px solid #3a3f44; }"
+            )
+        else:
+            self.search_button.setText("Search Metadata")
+            self.search_button.setToolTip("")
+            self.review_button.setToolTip("")
+            self.rename_button.setToolTip("")
+
+            advanced_headers = [
+                "Original File", "Type", "Parsed Title", "S/E",
+                "TMDB Match", "Year", "Proposed Filename", "Status"
+            ]
+            for column, label in enumerate(advanced_headers):
+                item = self.table.horizontalHeaderItem(column)
+                if item:
+                    item.setText(label)
+            self.subtitle.setText("Movie & TV metadata renaming")
+            self.drop_area.setText("Drop movies, TV episodes, or folders here")
+            self.drop_area.setMinimumHeight(60)
+            self.drop_area.setStyleSheet(
+                "border: 2px dashed #555;"
+                "border-radius: 6px;"
+                "color: #aaa;"
+            )
+            self.rename_button.setStyleSheet("")
+
         self.setWindowTitle(
             "Rogue Renamer — Basic" if basic else "Rogue Renamer — Advanced"
         )
+        self.update_workflow_summary()
 
     def toggle_mode(self):
         self.current_mode = (
@@ -4276,7 +4565,11 @@ class RogueRenamer(QMainWindow):
 
         if count == 0:
             self.status_label.setText("0 files loaded")
+            self.status_label.setStyleSheet(
+                "color:#9fb4c5; font-weight:600; padding:3px 6px;"
+            )
             self.review_button.setEnabled(False)
+            self.update_workflow_summary()
             return
 
         ready = 0
@@ -4322,7 +4615,19 @@ class RogueRenamer(QMainWindow):
             parts.append(f"{pending} Pending")
 
         self.status_label.setText(" • ".join(parts))
+        if failed:
+            status_color = "#f0a3a3"
+        elif review:
+            status_color = "#f1d69a"
+        elif ready:
+            status_color = "#a9dfba"
+        else:
+            status_color = "#9fb4c5"
+        self.status_label.setStyleSheet(
+            f"color:{status_color}; font-weight:600; padding:3px 6px;"
+        )
         self.review_button.setEnabled(review > 0)
+        self.update_workflow_summary()
 
     def search_metadata(self):
         automation = self.get_automation_settings()
@@ -4489,7 +4794,7 @@ class RogueRenamer(QMainWindow):
 
                 elif confidence == "Review":
                     status = (
-                        f"⚠ Review — double-click match ({score})"
+                        f"⚠ Review — double click to match ({score})"
                     )
 
                 else:
@@ -5305,7 +5610,13 @@ def main():
         if setup.exec() != QDialog.DialogCode.Accepted:
             return
 
+    icon = rogue_app_icon()
+    if not icon.isNull():
+        app.setWindowIcon(icon)
+
     window = RogueRenamer()
+    if not icon.isNull():
+        window.setWindowIcon(icon)
 
     window.show()
 
