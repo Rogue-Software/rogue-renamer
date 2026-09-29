@@ -36,6 +36,8 @@ import requests
 
 from app.metadata.tmdb import (
     TMDBError,
+    get_tv_episode,
+    get_tv_season,
     match_media,
 )
 from app.parser import (
@@ -1467,7 +1469,13 @@ def audit_library(root_path):
 
     for (title, season, episode), paths_for_episode in episode_index.items():
         if len(paths_for_episode) > 1:
-            names = ", ".join(p.name for p in paths_for_episode)
+            display_paths = []
+            for duplicate_path in paths_for_episode:
+                try:
+                    display_paths.append(str(duplicate_path.relative_to(root)))
+                except ValueError:
+                    display_paths.append(str(duplicate_path))
+            names = " | ".join(display_paths)
             for path in paths_for_episode:
                 add(
                     "Problem",
@@ -1533,6 +1541,99 @@ def audit_library(root_path):
     return findings
 
 
+def add_tmdb_audit_findings(root_path, findings):
+    """Add read-only online TMDB verification to structural audit results."""
+    root = Path(root_path)
+    media_paths = sorted(
+        (p for p in root.rglob("*")
+         if p.is_file() and p.suffix.lower() in MEDIA_EXTENSIONS and not is_extra_video(p)),
+        key=lambda p: str(p).casefold(),
+    )
+    groups = {}
+    for path in media_paths:
+        parsed = parse_media_path(str(path))
+        if parsed.get("type") != "TV":
+            continue
+        key = ((parsed.get("title") or "").casefold(),
+               parsed.get("year"),
+               (parsed.get("country_hint") or "").casefold())
+        groups.setdefault(key, []).append({"path": path, "parsed": parsed})
+
+    for records in groups.values():
+        rep = records[0]
+        parsed = rep["parsed"]
+        try:
+            match = match_media(parsed)
+        except TMDBError as error:
+            findings.append({"severity":"Warning","category":"TMDB Audit",
+                "path":str(rep["path"]),"message":f"TMDB verification could not be completed: {error}"})
+            continue
+
+        if not match:
+            findings.append({"severity":"Problem","category":"TMDB Match",
+                "path":str(rep["path"]),"message":f'No TMDB match was found for "{parsed.get("title","Unknown")}".'})
+            continue
+
+        if match.get("confidence") == "Review":
+            reason=match.get("ambiguity_reason") or "match requires review"
+            findings.append({"severity":"Warning","category":"TMDB Match",
+                "path":str(rep["path"]),
+                "message":f'TMDB match for "{parsed.get("title","Unknown")}" is ambiguous: '
+                          f'{match.get("title","Unknown")} ({match.get("year") or "unknown year"}), '
+                          f'score {match.get("score",0)}/100 — {reason}. Gap checks skipped.'})
+            continue
+
+        tid=match.get("id"); title=match.get("title") or parsed.get("title") or "Unknown"
+        if not tid: continue
+
+        local={}; ep_paths={}
+        for rec in records:
+            p=rec["parsed"]; season=p.get("season")
+            for ep in p.get("episodes") or [p.get("episode")]:
+                if season is None or ep is None: continue
+                local.setdefault(season,set()).add(ep)
+                ep_paths.setdefault((season,ep),[]).append(rec["path"])
+
+        for season, local_eps in sorted(local.items()):
+            try:
+                sd=get_tv_season(tid,season)
+            except TMDBError as error:
+                findings.append({"severity":"Warning","category":"TMDB Season",
+                    "path":str(rep["path"]),"message":f"Could not verify {title} Season {season:02d}: {error}"})
+                continue
+
+            remote={int(e["episode_number"]):e for e in (sd.get("episodes") or [])
+                    if e.get("episode_number") is not None}
+            invalid=sorted(local_eps-set(remote))
+            for ep in invalid:
+                for path in ep_paths.get((season,ep),[rep["path"]]):
+                    findings.append({"severity":"Problem","category":"Invalid Episode","path":str(path),
+                        "message":f"{title} S{season:02d}E{ep:02d} does not exist in this TMDB season."})
+
+            # Only call gaps missing through the highest local episode. This avoids
+            # flagging the uncollected remainder of a season.
+            highest=max(local_eps) if local_eps else 0
+            expected={n for n in remote if 1 <= n <= highest}
+            missing=sorted(expected-local_eps)
+            if missing:
+                codes=", ".join(f"S{season:02d}E{ep:02d}" for ep in missing)
+                findings.append({"severity":"Warning","category":"Missing Episode",
+                    "path":str(rep["path"].parent),
+                    "message":f"{title} Season {season:02d} has local episodes through E{highest:02d}, "
+                              f"but {codes} {'is' if len(missing)==1 else 'are'} missing according to TMDB."})
+
+            valid=len(local_eps & set(remote))
+            if valid and not invalid:
+                findings.append({"severity":"OK","category":"TMDB Verified",
+                    "path":str(rep["path"].parent),
+                    "message":f"{title} Season {season:02d}: {valid} local episode"
+                              f"{'s' if valid != 1 else ''} verified against TMDB."})
+
+    order={"Problem":0,"Warning":1,"OK":2}
+    findings.sort(key=lambda x:(order.get(x["severity"],9),x["category"].casefold(),x["path"].casefold()))
+    return findings
+
+
 class LibraryAuditDialog(QDialog):
     def __init__(self, root_path, findings, parent=None):
         super().__init__(parent)
@@ -1565,6 +1666,13 @@ class LibraryAuditDialog(QDialog):
         self.filter_combo.addItems(["All", "Problems", "Warnings", "OK"])
         self.filter_combo.currentTextChanged.connect(self.populate)
         summary.addWidget(self.filter_combo)
+
+        self.tmdb_button = QPushButton("Verify with TMDB")
+        self.tmdb_button.setToolTip(
+            "Verify TV episodes and detect gaps using live TMDB metadata. This remains read-only."
+        )
+        self.tmdb_button.clicked.connect(self.verify_with_tmdb)
+        summary.addWidget(self.tmdb_button)
         layout.addLayout(summary)
 
         self.table = QTableWidget(0, 4)
@@ -1622,6 +1730,36 @@ class LibraryAuditDialog(QDialog):
         layout.addLayout(buttons)
 
         self.populate()
+
+
+    def verify_with_tmdb(self):
+        self.tmdb_button.setEnabled(False)
+        self.tmdb_button.setText("Verifying…")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        QApplication.processEvents()
+
+        online_categories = {
+            "TMDB Audit", "TMDB Match", "TMDB Season",
+            "Invalid Episode", "Missing Episode", "TMDB Verified",
+        }
+        self.findings = [
+            f for f in self.findings
+            if f.get("category") not in online_categories
+        ]
+        try:
+            add_tmdb_audit_findings(self.root_path, self.findings)
+        except Exception as error:
+            self.findings.append({
+                "severity":"Warning", "category":"TMDB Audit",
+                "path":self.root_path,
+                "message":f"TMDB verification stopped unexpectedly: {error}",
+            })
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.tmdb_button.setEnabled(True)
+            self.tmdb_button.setText("Verify with TMDB")
+        self.populate()
+
 
     def populate(self):
         selected = self.filter_combo.currentText()

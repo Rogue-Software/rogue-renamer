@@ -440,6 +440,19 @@ def search_tv_candidates(parsed):
     return candidates
 
 
+
+def get_tv_season(tmdb_id, season_number):
+    """Return TMDB season metadata for read-only library auditing."""
+    return request_tmdb(f"/tv/{int(tmdb_id)}/season/{int(season_number)}")
+
+
+def get_tv_episode(tmdb_id, season_number, episode_number):
+    """Return one TMDB episode record for read-only library auditing."""
+    return request_tmdb(
+        f"/tv/{int(tmdb_id)}/season/{int(season_number)}"
+        f"/episode/{int(episode_number)}"
+    )
+
 def get_candidates(parsed):
     if parsed["type"] == "Movie":
         return search_movie_candidates(
