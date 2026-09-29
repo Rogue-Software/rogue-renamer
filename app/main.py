@@ -1634,6 +1634,77 @@ def add_tmdb_audit_findings(root_path, findings):
     return findings
 
 
+def build_audit_fix_plan(root_path, finding):
+    """Build one conservative read-only suggested correction."""
+    category=finding.get("category","")
+    source=Path(finding.get("path",""))
+    root=Path(root_path)
+    plan={"available":False,"confidence":None,"current":str(source),
+          "suggested":None,"reason":None}
+
+    if not source.exists() or not source.is_file():
+        return plan
+
+    parsed=parse_media_path(str(source))
+    if parsed.get("type") not in {"TV","Movie"}:
+        return plan
+
+    if category not in {
+        "TV Structure","Season Conflict","Title Conflict","Movie Naming",
+        "Unparseable Media"
+    }:
+        return plan
+
+    try:
+        match=match_media(parsed)
+    except TMDBError as error:
+        plan["reason"]=f"TMDB verification unavailable: {error}"
+        return plan
+
+    if not match:
+        plan["reason"]="No TMDB match was found."
+        return plan
+
+    if match.get("confidence")!="High":
+        plan["reason"]=(
+            f"Match confidence is {match.get('confidence','Unknown')} "
+            f"({match.get('score',0)}/100); Rogue will not suggest a filesystem fix."
+        )
+        return plan
+
+    proposed_name=build_proposed_filename(source,match)
+    org=get_organization_settings()
+
+    if match["type"]=="Movie":
+        values={"title":match.get("title",""),"year":match.get("year") or "",
+                "tmdb_id":match.get("id") or ""}
+        rel=render_folder_template(org["movie_folder_template"],values)
+    else:
+        values={"title":match.get("title",""),"year":match.get("year") or "",
+                "season":match.get("season") or 0,"episode":match.get("episode") or 0,
+                "episodes":format_episode_numbers(match),
+                "episode_code":format_episode_code(match),
+                "episode_title":match.get("episode_title") or "",
+                "tmdb_id":match.get("id") or ""}
+        rel=render_folder_template(org["tv_folder_template"],values)
+
+    destination=root/rel/proposed_name
+    if destination==source:
+        plan["reason"]="The current path already matches Rogue's naming and folder templates."
+        return plan
+
+    plan.update({
+        "available":True,
+        "confidence":f"High ({match.get('score',0)}/100)",
+        "suggested":str(destination),
+        "reason":(
+            f"TMDB verified as {match.get('title',parsed.get('title','Unknown'))} "
+            f"({match.get('year') or 'unknown year'}), TMDB #{match.get('id','?')}."
+        ),
+    })
+    return plan
+
+
 class LibraryAuditDialog(QDialog):
     def __init__(self, root_path, findings, parent=None):
         super().__init__(parent)
@@ -1673,6 +1744,13 @@ class LibraryAuditDialog(QDialog):
         )
         self.tmdb_button.clicked.connect(self.verify_with_tmdb)
         summary.addWidget(self.tmdb_button)
+
+        self.fix_plan_button = QPushButton("Suggest Fix")
+        self.fix_plan_button.setToolTip(
+            "Show a read-only suggested correction for the selected finding. No files will be changed."
+        )
+        self.fix_plan_button.clicked.connect(self.suggest_selected_fix)
+        summary.addWidget(self.fix_plan_button)
         layout.addLayout(summary)
 
         self.table = QTableWidget(0, 4)
@@ -1698,8 +1776,8 @@ class LibraryAuditDialog(QDialog):
 
         self.details = QTextEdit()
         self.details.setReadOnly(True)
-        self.details.setMinimumHeight(125)
-        self.details.setMaximumHeight(190)
+        self.details.setMinimumHeight(155)
+        self.details.setMaximumHeight(250)
         self.details.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         self.details.setStyleSheet("""
             QTextEdit {
@@ -1730,6 +1808,48 @@ class LibraryAuditDialog(QDialog):
         layout.addLayout(buttons)
 
         self.populate()
+
+
+
+    def suggest_selected_fix(self):
+        rows=self.table.selectionModel().selectedRows()
+        if not rows:
+            QMessageBox.information(self,"Suggest Fix","Select an audit finding first.")
+            return
+
+        item=self.table.item(rows[0].row(),0)
+        finding=item.data(Qt.ItemDataRole.UserRole) if item else None
+        if not finding:
+            return
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        QApplication.processEvents()
+        try:
+            plan=build_audit_fix_plan(self.root_path,finding)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        text=(
+            f"Status: {finding['severity']}\n"
+            f"Category: {finding['category']}\n"
+            f"File: {finding['path']}\n\n"
+            f"{finding['message']}"
+        )
+        if plan.get("available"):
+            text+=(
+                "\n\nSUGGESTED FIX — READ ONLY\n"
+                f"Confidence: {plan['confidence']}\n"
+                f"Current: {plan['current']}\n"
+                f"Suggested: {plan['suggested']}\n\n"
+                f"Why: {plan['reason']}\n\nNo files have been changed."
+            )
+        else:
+            text+=(
+                "\n\nSUGGESTED FIX\nNo automatic fix suggested.\n\n"
+                f"Reason: {plan.get('reason') or 'Rogue does not have a safe automatic suggestion for this finding.'}"
+                "\n\nNo files have been changed."
+            )
+        self.details.setPlainText(text)
 
 
     def verify_with_tmdb(self):
