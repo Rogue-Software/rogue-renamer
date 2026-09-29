@@ -1634,7 +1634,59 @@ def add_tmdb_audit_findings(root_path, findings):
     return findings
 
 
-def build_audit_fix_plan(root_path, finding):
+
+def collect_verified_tv_matches(root_path):
+    """Learn unique High-confidence TV identities from files in this audit tree."""
+    root = Path(root_path)
+    identities = {}
+
+    media_paths = sorted(
+        (
+            p for p in root.rglob("*")
+            if p.is_file()
+            and p.suffix.lower() in MEDIA_EXTENSIONS
+            and not is_extra_video(p)
+        ),
+        key=lambda p: str(p).casefold(),
+    )
+
+    # Stronger filenames first: year/country hints can disambiguate titles such
+    # as The Office or Doctor Who, then the verified identity can safely help
+    # weaker filenames with the same parsed title.
+    parsed_items = []
+    for path in media_paths:
+        parsed = parse_media_path(str(path))
+        if parsed.get("type") != "TV":
+            continue
+        strength = int(bool(parsed.get("year"))) + int(bool(parsed.get("country_hint")))
+        parsed_items.append((strength, path, parsed))
+
+    parsed_items.sort(key=lambda item: (-item[0], str(item[1]).casefold()))
+
+    candidates_by_title = {}
+    for _strength, _path, parsed in parsed_items:
+        title_key = (parsed.get("title") or "").strip().casefold()
+        if not title_key:
+            continue
+        try:
+            match = match_media(parsed)
+        except Exception:
+            continue
+        if not match or match.get("confidence") != "High" or not match.get("id"):
+            continue
+
+        candidates_by_title.setdefault(title_key, {})[match["id"]] = match
+
+    # Only trust a title-wide identity when every High-confidence observation
+    # agrees on the same TMDB series.
+    for title_key, by_id in candidates_by_title.items():
+        if len(by_id) == 1:
+            identities[title_key] = next(iter(by_id.values()))
+
+    return identities
+
+
+def build_audit_fix_plan(root_path, finding, verified_tv_matches=None):
     """Build one conservative read-only suggested correction."""
     category=finding.get("category","")
     source=Path(finding.get("path",""))
@@ -1642,35 +1694,110 @@ def build_audit_fix_plan(root_path, finding):
     plan={"available":False,"confidence":None,"current":str(source),
           "suggested":None,"reason":None}
 
-    if not source.exists() or not source.is_file():
+    if not source.exists():
+        plan["reason"] = f"Source path does not exist: {source}"
+        return plan
+
+    if not source.is_file():
+        plan["reason"] = f"Selected finding is not a file: {source}"
         return plan
 
     parsed=parse_media_path(str(source))
     if parsed.get("type") not in {"TV","Movie"}:
-        return plan
-
-    if category not in {
-        "TV Structure","Season Conflict","Title Conflict","Movie Naming",
-        "Unparseable Media"
-    }:
-        return plan
-
-    try:
-        match=match_media(parsed)
-    except TMDBError as error:
-        plan["reason"]=f"TMDB verification unavailable: {error}"
-        return plan
-
-    if not match:
-        plan["reason"]="No TMDB match was found."
-        return plan
-
-    if match.get("confidence")!="High":
-        plan["reason"]=(
-            f"Match confidence is {match.get('confidence','Unknown')} "
-            f"({match.get('score',0)}/100); Rogue will not suggest a filesystem fix."
+        plan["reason"] = (
+            f"Parser identified this file as {parsed.get('type', 'Unknown')!r}, "
+            f"not TV or Movie. Parsed title: {parsed.get('title')!r}."
         )
         return plan
+
+    supported_categories = {
+        "TV Structure","Season Conflict","Title Conflict","Movie Naming",
+        "Unparseable Media"
+    }
+    if category not in supported_categories:
+        plan["reason"] = (
+            f'Finding category "{category}" does not currently have a safe '
+            "automatic repair."
+        )
+        return plan
+
+    match = None
+    reused_verified_identity = False
+
+    # Audit repair may reuse a unique High-confidence identity learned from
+    # stronger filenames elsewhere in the SAME audited tree. We still verify
+    # the requested episode against that exact TMDB series before suggesting
+    # any filesystem change.
+    if parsed.get("type") == "TV" and verified_tv_matches:
+        title_key = (parsed.get("title") or "").strip().casefold()
+        verified = verified_tv_matches.get(title_key)
+
+        if verified and verified.get("id"):
+            season = parsed.get("season")
+            episodes = parsed.get("episodes") or [parsed.get("episode")]
+
+            if season is not None and all(ep is not None for ep in episodes):
+                episode_details = []
+                try:
+                    for ep in episodes:
+                        data = get_tv_episode(verified["id"], season, ep)
+                        if not data:
+                            raise TMDBError(
+                                f"S{season:02d}E{ep:02d} was not found for "
+                                f"{verified.get('title', parsed.get('title', 'this series'))}."
+                            )
+                        episode_details.append({
+                            "episode": ep,
+                            "name": data.get("name") or f"Episode {ep}",
+                            "air_date": data.get("air_date"),
+                        })
+                except TMDBError as error:
+                    plan["reason"] = (
+                        f"Verified series identity could not validate the requested "
+                        f"episode: {error}"
+                    )
+                    return plan
+
+                episode_title = " + ".join(
+                    detail["name"] for detail in episode_details
+                )
+                match = dict(verified)
+                match.update({
+                    "type": "TV",
+                    "season": season,
+                    "episode": episodes[0],
+                    "episodes": episodes,
+                    "episode_title": episode_title,
+                    "episode_details": episode_details,
+                    "confidence": "High",
+                    "score": 100,
+                })
+                reused_verified_identity = True
+
+    if match is None:
+        try:
+            match=match_media(parsed)
+        except TMDBError as error:
+            plan["reason"]=f"TMDB verification unavailable: {error}"
+            return plan
+        except Exception as error:
+            plan["reason"] = (
+                f"Unexpected metadata error: {type(error).__name__}: {error}"
+            )
+            return plan
+
+        if not match:
+            plan["reason"]="No TMDB match was found."
+            return plan
+
+        if match.get("confidence")!="High":
+            plan["reason"]=(
+                f"Match confidence is {match.get('confidence','Unknown')} "
+                f"({match.get('score',0)}/100); Rogue will not suggest a filesystem fix. "
+                f"Run Verify with TMDB first so Rogue can reuse a verified series "
+                f"identity from stronger filenames in this library."
+            )
+            return plan
 
     proposed_name=build_proposed_filename(source,match)
     org=get_organization_settings()
@@ -1697,10 +1824,16 @@ def build_audit_fix_plan(root_path, finding):
         "available":True,
         "confidence":f"High ({match.get('score',0)}/100)",
         "suggested":str(destination),
+        "match": match,
         "reason":(
-            f"TMDB verified as {match.get('title',parsed.get('title','Unknown'))} "
-            f"({match.get('year') or 'unknown year'}), TMDB #{match.get('id','?')}."
-        ),
+            (
+                "Reused verified library identity and confirmed the requested "
+                "episode against TMDB: "
+            )
+            if reused_verified_identity else "TMDB verified as "
+        )
+        + f"{match.get('title',parsed.get('title','Unknown'))} "
+          f"({match.get('year') or 'unknown year'}), TMDB #{match.get('id','?')}.",
     })
     return plan
 
@@ -1710,6 +1843,9 @@ class LibraryAuditDialog(QDialog):
         super().__init__(parent)
         self.root_path = str(root_path)
         self.findings = findings
+        self.current_fix_plan = None
+        self.current_fix_finding = None
+        self.verified_tv_matches = {}
 
         self.setWindowTitle("Rogue Renamer — Library Audit")
         self.resize(1180, 720)
@@ -1751,6 +1887,16 @@ class LibraryAuditDialog(QDialog):
         )
         self.fix_plan_button.clicked.connect(self.suggest_selected_fix)
         summary.addWidget(self.fix_plan_button)
+
+        self.apply_fix_button = QPushButton("Apply Selected Fix")
+        self.apply_fix_button.setToolTip(
+            "Apply the currently suggested High-confidence repair using "
+            "Rogue's normal confirmation, collision, History and Undo safeguards."
+        )
+        self.apply_fix_button.setEnabled(False)
+        self.apply_fix_button.clicked.connect(self.apply_selected_fix)
+        summary.addWidget(self.apply_fix_button)
+
         layout.addLayout(summary)
 
         self.table = QTableWidget(0, 4)
@@ -1825,7 +1971,11 @@ class LibraryAuditDialog(QDialog):
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         QApplication.processEvents()
         try:
-            plan=build_audit_fix_plan(self.root_path,finding)
+            plan=build_audit_fix_plan(
+                self.root_path,
+                finding,
+                self.verified_tv_matches,
+            )
         finally:
             QApplication.restoreOverrideCursor()
 
@@ -1836,14 +1986,22 @@ class LibraryAuditDialog(QDialog):
             f"{finding['message']}"
         )
         if plan.get("available"):
+            self.current_fix_plan = plan
+            self.current_fix_finding = finding
+            self.apply_fix_button.setEnabled(True)
             text+=(
-                "\n\nSUGGESTED FIX — READ ONLY\n"
+                "\n\nSUGGESTED FIX — READY TO APPLY\n"
                 f"Confidence: {plan['confidence']}\n"
                 f"Current: {plan['current']}\n"
                 f"Suggested: {plan['suggested']}\n\n"
-                f"Why: {plan['reason']}\n\nNo files have been changed."
+                f"Why: {plan['reason']}\n\n"
+                "Press Apply Selected Fix to preview the video and all attached "
+                "companions before anything changes."
             )
         else:
+            self.current_fix_plan = None
+            self.current_fix_finding = None
+            self.apply_fix_button.setEnabled(False)
             text+=(
                 "\n\nSUGGESTED FIX\nNo automatic fix suggested.\n\n"
                 f"Reason: {plan.get('reason') or 'Rogue does not have a safe automatic suggestion for this finding.'}"
@@ -1851,8 +2009,64 @@ class LibraryAuditDialog(QDialog):
             )
         self.details.setPlainText(text)
 
+    def apply_selected_fix(self):
+        plan = self.current_fix_plan
+        finding = self.current_fix_finding
+
+        if not plan or not finding or not plan.get("available"):
+            QMessageBox.information(
+                self,
+                "Apply Fix",
+                "Use Suggest Fix on a supported High-confidence finding first.",
+            )
+            return
+
+        parent = self.parent()
+        if not parent or not hasattr(parent, "apply_audit_fix"):
+            QMessageBox.critical(
+                self,
+                "Apply Fix",
+                "The main Rogue Renamer window is unavailable.",
+            )
+            return
+
+        result = parent.apply_audit_fix(plan, finding)
+        if not result:
+            return
+
+        # The filesystem changed, so refresh the local structural audit instead
+        # of leaving stale findings on screen.
+        self.findings = audit_library(self.root_path)
+        self.current_fix_plan = None
+        self.current_fix_finding = None
+        self.apply_fix_button.setEnabled(False)
+        self.populate()
+
+        QMessageBox.information(
+            self,
+            "Audit Repair Complete",
+            "The selected repair was completed and added to Rename History. "
+            "It can be restored with Undo/History.",
+        )
+
 
     def verify_with_tmdb(self):
+        # Preserve the currently selected audit finding across the TMDB refresh.
+        selected_key = None
+        selected_rows = self.table.selectionModel().selectedRows()
+        if selected_rows:
+            selected_item = self.table.item(selected_rows[0].row(), 0)
+            selected_finding = (
+                selected_item.data(Qt.ItemDataRole.UserRole)
+                if selected_item else None
+            )
+            if selected_finding:
+                selected_key = (
+                    selected_finding.get("path", "").casefold(),
+                    selected_finding.get("category", "").casefold(),
+                    selected_finding.get("message", "").casefold(),
+                )
+
         self.tmdb_button.setEnabled(False)
         self.tmdb_button.setText("Verifying…")
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
@@ -1868,6 +2082,7 @@ class LibraryAuditDialog(QDialog):
         ]
         try:
             add_tmdb_audit_findings(self.root_path, self.findings)
+            self.verified_tv_matches = collect_verified_tv_matches(self.root_path)
         except Exception as error:
             self.findings.append({
                 "severity":"Warning", "category":"TMDB Audit",
@@ -1878,10 +2093,10 @@ class LibraryAuditDialog(QDialog):
             QApplication.restoreOverrideCursor()
             self.tmdb_button.setEnabled(True)
             self.tmdb_button.setText("Verify with TMDB")
-        self.populate()
+        self.populate(selection_key=selected_key)
 
 
-    def populate(self):
+    def populate(self, _text=None, selection_key=None):
         selected = self.filter_combo.currentText()
         wanted = {
             "Problems": "Problem",
@@ -1922,11 +2137,35 @@ class LibraryAuditDialog(QDialog):
                 self.table.setItem(row, column, item)
 
         if self.table.rowCount():
-            self.table.selectRow(0)
+            row_to_select = 0
+            if selection_key:
+                for row in range(self.table.rowCount()):
+                    item = self.table.item(row, 0)
+                    finding = item.data(Qt.ItemDataRole.UserRole) if item else None
+                    if not finding:
+                        continue
+                    row_key = (
+                        finding.get("path", "").casefold(),
+                        finding.get("category", "").casefold(),
+                        finding.get("message", "").casefold(),
+                    )
+                    if row_key == selection_key:
+                        row_to_select = row
+                        break
+
+            self.table.selectRow(row_to_select)
+            self.table.scrollToItem(
+                self.table.item(row_to_select, 0),
+                QTableWidget.ScrollHint.PositionAtCenter,
+            )
         else:
             self.details.clear()
 
     def update_details(self):
+        self.current_fix_plan = None
+        self.current_fix_finding = None
+        self.apply_fix_button.setEnabled(False)
+
         selected_rows = self.table.selectionModel().selectedRows()
         if not selected_rows:
             self.details.clear()
@@ -3307,6 +3546,180 @@ class RogueRenamer(QMainWindow):
                 return
 
         self.rename_button.setEnabled(True)
+
+    def build_audit_repair_plan(self, fix_plan):
+        """Build a validated video+companion plan for one approved audit repair."""
+        errors = []
+        plan = []
+        destinations = set()
+
+        source = Path(fix_plan.get("current", ""))
+        destination = Path(fix_plan.get("suggested", ""))
+
+        if not fix_plan.get("available"):
+            return [], ["The audit finding does not have an approved fix plan."]
+
+        if not source.exists() or not source.is_file():
+            return [], [f"Source file is missing: {source}"]
+
+        match = fix_plan.get("match") or {}
+        if match.get("confidence") != "High":
+            return [], ["Audit repairs require a High-confidence metadata match."]
+
+        batch_items = [{
+            "row": None,
+            "source": source,
+            "destination": destination,
+            "kind": "video",
+        }]
+
+        for companion in find_companion_files(source):
+            batch_items.append({
+                "row": None,
+                "source": companion,
+                "destination": build_companion_destination(
+                    destination,
+                    companion,
+                ),
+                "kind": "companion",
+            })
+
+        for item in batch_items:
+            item_source = item["source"]
+            item_destination = item["destination"]
+            source_key = str(item_source.absolute()).casefold()
+            destination_key = str(item_destination.absolute()).casefold()
+
+            if destination_key in destinations:
+                errors.append(f"Duplicate destination: {item_destination}")
+                continue
+            destinations.add(destination_key)
+
+            if not item_source.exists():
+                errors.append(f"Source file is missing: {item_source}")
+                continue
+
+            if source_key == destination_key:
+                continue
+
+            if item_destination.exists():
+                errors.append(f"Destination already exists: {item_destination}")
+                continue
+
+            plan.append(item)
+
+        return plan, errors
+
+    def execute_validated_plan(self, plan):
+        """Execute a prevalidated plan with rollback and History/Undo support."""
+        completed = []
+
+        try:
+            for item in plan:
+                source = item["source"]
+                destination = item["destination"]
+
+                if not source.exists():
+                    raise FileNotFoundError(
+                        f"Source disappeared before repair: {source}"
+                    )
+                if destination.exists():
+                    raise FileExistsError(
+                        f"Destination appeared during repair: {destination}"
+                    )
+
+                created_directories = []
+                parent = destination.parent
+                missing = []
+                cursor = parent
+                while not cursor.exists():
+                    missing.append(cursor)
+                    cursor = cursor.parent
+
+                parent.mkdir(parents=True, exist_ok=True)
+                created_directories.extend(missing)
+                source.rename(destination)
+
+                completed.append({
+                    "row": item.get("row"),
+                    "old": source,
+                    "new": destination,
+                    "kind": item.get("kind", "video"),
+                    "created_directories": created_directories,
+                })
+
+        except Exception as error:
+            rollback_errors = []
+
+            for item in reversed(completed):
+                try:
+                    if item["new"].exists() and not item["old"].exists():
+                        item["new"].rename(item["old"])
+
+                    for directory in item.get("created_directories", []):
+                        try:
+                            directory.rmdir()
+                        except OSError:
+                            pass
+                except Exception as rollback_error:
+                    rollback_errors.append(str(rollback_error))
+
+            message = (
+                f"Repair failed:\n\n{error}\n\n"
+                "Any completed file operations were rolled back."
+            )
+            if rollback_errors:
+                message += (
+                    "\n\nSome rollback operations also failed:\n"
+                    + "\n".join(rollback_errors)
+                )
+
+            QMessageBox.critical(self, "Audit Repair Failed", message)
+            return False
+
+        if not completed:
+            return False
+
+        self.save_completed_batch(completed)
+        self.last_rename_batch = completed
+        self.undo_button.setEnabled(True)
+        return True
+
+    def apply_audit_fix(self, fix_plan, finding):
+        """Confirm and apply one High-confidence audit repair."""
+        plan, errors = self.build_audit_repair_plan(fix_plan)
+
+        if errors:
+            QMessageBox.critical(
+                self,
+                "Audit Repair Blocked",
+                "Rogue Renamer found problems and did not change anything:\n\n"
+                + "\n".join(errors[:12])
+                + (
+                    f"\n\n...and {len(errors) - 12} more."
+                    if len(errors) > 12
+                    else ""
+                ),
+            )
+            return False
+
+        if not plan:
+            QMessageBox.information(
+                self,
+                "Nothing to Repair",
+                "The selected file already matches the suggested destination.",
+            )
+            return False
+
+        confirm_dialog = RenameConfirmationDialog(plan, self)
+        confirm_dialog.setWindowTitle("Confirm Audit Repair")
+        confirm_dialog.setStyleSheet(self.styleSheet())
+
+        if confirm_dialog.exec() != QDialog.DialogCode.Accepted:
+            return False
+
+        return self.execute_validated_plan(plan)
+
 
     def build_rename_plan(self):
         """Validate video and companion destinations before changing files."""
