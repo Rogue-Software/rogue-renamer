@@ -8,8 +8,8 @@ import subprocess
 import json
 import shutil
 
-from PySide6.QtCore import Qt, QByteArray, QObject, QThread, Signal
-from PySide6.QtGui import QPixmap
+from PySide6.QtCore import Qt, QByteArray, QObject, QThread, Signal, QUrl
+from PySide6.QtGui import QPixmap, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -35,6 +35,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QScrollArea,
+    QStackedWidget,
+    QButtonGroup,
+    QRadioButton,
 )
 
 import requests
@@ -309,6 +312,408 @@ def build_companion_destination(video_destination, companion_path):
     )
 
 
+
+class FirstRunSetupDialog(QDialog):
+    """First-launch setup for open-source Rogue Renamer."""
+
+    TMDB_URL = "https://www.themoviedb.org/settings/api"
+    TVDB_URL = "https://thetvdb.com/api-information"
+    OMDB_URL = "https://www.omdbapi.com/apikey.aspx"
+    FFMPEG_URL = "https://ffmpeg.org/download.html"
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.config = load_config()
+        self.selected_mode = "basic"
+
+        self.setWindowTitle("Welcome to Rogue Renamer")
+        self.resize(820, 760)
+        self.setMinimumSize(700, 620)
+
+        # The first-run dialog is created before the main Rogue window, so on
+        # Windows it cannot rely on the main window's dark stylesheet. Give the
+        # complete wizard an explicit Rogue palette so native light-theme
+        # defaults never produce black-on-black or pale-on-white controls.
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #14171a;
+                color: #eeeeee;
+            }
+            QWidget {
+                color: #eeeeee;
+            }
+            QLabel {
+                color: #eeeeee;
+                background: transparent;
+            }
+            QScrollArea {
+                background-color: #14171a;
+                border: 1px solid #3f454b;
+            }
+            QScrollArea > QWidget > QWidget {
+                background-color: #14171a;
+            }
+            QLineEdit {
+                background-color: #202428;
+                color: #ffffff;
+                border: 1px solid #59616a;
+                border-radius: 3px;
+                padding: 7px;
+                selection-background-color: #3b4654;
+                selection-color: #ffffff;
+            }
+            QPushButton {
+                background-color: #2a2f35;
+                color: #f4f4f4;
+                border: 1px solid #505861;
+                border-radius: 4px;
+                padding: 8px 12px;
+            }
+            QPushButton:hover {
+                background-color: #353c43;
+                border-color: #78838e;
+            }
+            QPushButton:pressed {
+                background-color: #20252a;
+            }
+            QPushButton:disabled {
+                background-color: #202428;
+                color: #747b82;
+                border-color: #383e44;
+            }
+            QRadioButton {
+                color: #eeeeee;
+                spacing: 8px;
+                padding: 4px 0;
+            }
+            QRadioButton::indicator {
+                width: 16px;
+                height: 16px;
+                border: 2px solid #8a949e;
+                border-radius: 9px;
+                background-color: #171a1d;
+            }
+            QRadioButton::indicator:hover {
+                border-color: #c6d0da;
+                background-color: #22272c;
+            }
+            QRadioButton::indicator:checked {
+                border: 2px solid #9fd3ff;
+                background-color: #1677c8;
+            }
+            QRadioButton::indicator:checked:hover {
+                border-color: #d5ebff;
+                background-color: #2389d7;
+            }
+            QScrollBar:vertical {
+                background: #181c20;
+                width: 12px;
+                margin: 0;
+            }
+            QScrollBar::handle:vertical {
+                background: #59616a;
+                min-height: 30px;
+                border-radius: 5px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #737d87;
+            }
+            QScrollBar::add-line:vertical,
+            QScrollBar::sub-line:vertical {
+                height: 0;
+            }
+        """)
+
+        outer = QVBoxLayout(self)
+
+        title = QLabel("Welcome to Rogue Renamer")
+        title.setStyleSheet("font-size:28px; font-weight:bold;")
+        outer.addWidget(title)
+
+        subtitle = QLabel(
+            "Let's set up your metadata providers. Your API credentials stay "
+            "in Rogue Renamer's local configuration on this computer."
+        )
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet("color:#c7cdd3; margin-bottom:8px;")
+        outer.addWidget(subtitle)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet(
+            "QScrollArea { background:#14171a; border:none; } "
+            "QScrollArea > QWidget > QWidget { background:#14171a; }"
+        )
+        body = QWidget()
+        body.setStyleSheet("background:#14171a;")
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(12, 8, 12, 8)
+
+        self.tmdb_token = self._provider_section(
+            layout,
+            "TMDB",
+            "General movie and TV metadata. Rogue can use the API Read Access Token.",
+            "Get a TMDB API key / token",
+            self.TMDB_URL,
+            "API Read Access Token:",
+            self.config.get("tmdb", {}).get("access_token", ""),
+        )
+        self.tmdb_status = QLabel("Not tested")
+        layout.addWidget(self.tmdb_status)
+        btn = QPushButton("Test TMDB")
+        btn.clicked.connect(self.test_tmdb)
+        layout.addWidget(btn)
+
+        self.tvdb_key = self._provider_section(
+            layout,
+            "TheTVDB",
+            "TV and episode metadata. A subscriber PIN is optional.",
+            "Get a TheTVDB API key",
+            self.TVDB_URL,
+            "API Key:",
+            self.config.get("tvdb", {}).get("api_key", ""),
+        )
+        tvdb_form = QFormLayout()
+        self.tvdb_pin = QLineEdit()
+        self.tvdb_pin.setEchoMode(QLineEdit.EchoMode.Password)
+        self.tvdb_pin.setText(self.config.get("tvdb", {}).get("pin", ""))
+        tvdb_form.addRow("PIN (optional):", self.tvdb_pin)
+        layout.addLayout(tvdb_form)
+        self.tvdb_status = QLabel("Not tested")
+        layout.addWidget(self.tvdb_status)
+        btn = QPushButton("Test TheTVDB")
+        btn.clicked.connect(self.test_tvdb)
+        layout.addWidget(btn)
+
+        self.omdb_key = self._provider_section(
+            layout,
+            "OMDb",
+            "An additional movie and TV metadata source.",
+            "Get an OMDb API key",
+            self.OMDB_URL,
+            "API Key:",
+            self.config.get("omdb", {}).get("api_key", ""),
+        )
+        self.omdb_status = QLabel("Not tested")
+        layout.addWidget(self.omdb_status)
+        btn = QPushButton("Test OMDb")
+        btn.clicked.connect(self.test_omdb)
+        layout.addWidget(btn)
+
+        heading = QLabel("AniList")
+        heading.setStyleSheet("font-size:19px; font-weight:bold; margin-top:16px;")
+        layout.addWidget(heading)
+        note = QLabel(
+            "Anime metadata. No API key is required. AniList can be selected "
+            "later from Rogue's metadata provider menu."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#c0c5ca;")
+        layout.addWidget(note)
+        self.anilist_status = QLabel("No API key required")
+        layout.addWidget(self.anilist_status)
+        btn = QPushButton("Test AniList")
+        btn.clicked.connect(self.test_anilist)
+        layout.addWidget(btn)
+
+        heading = QLabel("FFmpeg — Optional but Recommended")
+        heading.setStyleSheet("font-size:19px; font-weight:bold; margin-top:16px;")
+        layout.addWidget(heading)
+        ff = QLabel()
+        ff.setWordWrap(True)
+        ff.setTextFormat(Qt.TextFormat.RichText)
+        ff.setOpenExternalLinks(True)
+        ff.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        ff.setStyleSheet("QLabel a { color:#9fd3ff; font-weight:bold; text-decoration:underline; }")
+        ff.setText(
+            "FFmpeg gives Rogue deeper duplicate inspection using resolution, "
+            "codec, bitrate, HDR, audio and other technical information. "
+            "<a href='https://ffmpeg.org/download.html'>Install FFmpeg</a>"
+        )
+        layout.addWidget(ff)
+        self.ffmpeg_status = QLabel()
+        layout.addWidget(self.ffmpeg_status)
+        self.refresh_ffmpeg_status()
+
+        heading = QLabel("Choose Your Experience")
+        heading.setStyleSheet("font-size:21px; font-weight:bold; margin-top:18px;")
+        layout.addWidget(heading)
+
+        self.basic_radio = QRadioButton(
+            "Basic — simple rename-in-place workflow"
+        )
+        self.advanced_radio = QRadioButton(
+            "Advanced — all Rogue Renamer features"
+        )
+        self.basic_radio.setChecked(True)
+        layout.addWidget(self.basic_radio)
+        layout.addWidget(self.advanced_radio)
+
+        mode_help = QLabel(
+            "You can switch modes later. Basic mode will keep media in its "
+            "current folders; Advanced mode exposes library auditing, organization, "
+            "history, automation and the rest of Rogue's tools."
+        )
+        mode_help.setWordWrap(True)
+        mode_help.setStyleSheet("color:#c0c5ca;")
+        layout.addWidget(mode_help)
+
+        layout.addStretch()
+        scroll.setWidget(body)
+        outer.addWidget(scroll, 1)
+
+        footer = QHBoxLayout()
+        skip = QPushButton("Skip for Now")
+        skip.clicked.connect(self.reject)
+        finish = QPushButton("Save & Finish Setup")
+        finish.setDefault(True)
+        finish.clicked.connect(self.finish_setup)
+        footer.addWidget(skip)
+        footer.addStretch()
+        footer.addWidget(finish)
+        outer.addLayout(footer)
+
+    def _provider_section(
+        self, layout, title, description, link_text, link_url,
+        field_label, current_value
+    ):
+        heading = QLabel(title)
+        heading.setStyleSheet("font-size:19px; font-weight:bold; margin-top:16px;")
+        layout.addWidget(heading)
+
+        help_label = QLabel(description)
+        help_label.setWordWrap(True)
+        help_label.setStyleSheet("color:#c0c5ca;")
+        layout.addWidget(help_label)
+
+        link = QLabel(
+            f"<a href='{link_url}'>{link_text}</a>"
+        )
+        link.setTextFormat(Qt.TextFormat.RichText)
+        link.setOpenExternalLinks(True)
+        link.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        link.setStyleSheet(
+            "QLabel a { color:#9fd3ff; font-weight:bold; text-decoration:underline; }"
+        )
+        layout.addWidget(link)
+
+        form = QFormLayout()
+        field = QLineEdit()
+        field.setEchoMode(QLineEdit.EchoMode.Password)
+        field.setText(current_value or "")
+        form.addRow(field_label, field)
+        layout.addLayout(form)
+        return field
+
+    def _save_entered_credentials(self):
+        self.config["tmdb"] = dict(self.config.get("tmdb", {}))
+        self.config["tmdb"]["access_token"] = self.tmdb_token.text().strip()
+
+        self.config["tvdb"] = {
+            "api_key": self.tvdb_key.text().strip(),
+            "pin": self.tvdb_pin.text().strip(),
+        }
+        self.config["omdb"] = {
+            "api_key": self.omdb_key.text().strip(),
+        }
+        save_config(self.config)
+
+    def test_tmdb(self):
+        token = self.tmdb_token.text().strip()
+        if not token:
+            self.tmdb_status.setText("❌ Enter a TMDB API Read Access Token.")
+            return
+        try:
+            response = requests.get(
+                "https://api.themoviedb.org/3/configuration",
+                headers={"Authorization": f"Bearer {token}", "accept": "application/json"},
+                timeout=10,
+            )
+            self.tmdb_status.setText(
+                "✓ Connected to TMDB" if response.status_code == 200
+                else "❌ TMDB connection failed"
+            )
+        except requests.RequestException:
+            self.tmdb_status.setText("❌ Could not connect to TMDB")
+
+    def test_tvdb(self):
+        if not self.tvdb_key.text().strip():
+            self.tvdb_status.setText("❌ Enter a TheTVDB API key.")
+            return
+        old = dict(self.config.get("tvdb", {}))
+        self.config["tvdb"] = {
+            "api_key": self.tvdb_key.text().strip(),
+            "pin": self.tvdb_pin.text().strip(),
+        }
+        save_config(self.config)
+        try:
+            tvdb.test_connection()
+            self.tvdb_status.setText("✓ Connected to TheTVDB")
+        except tvdb.TVDBError as error:
+            self.tvdb_status.setText(f"❌ {error}")
+        finally:
+            self.config["tvdb"] = old
+            save_config(self.config)
+
+    def test_omdb(self):
+        if not self.omdb_key.text().strip():
+            self.omdb_status.setText("❌ Enter an OMDb API key.")
+            return
+        old = dict(self.config.get("omdb", {}))
+        self.config["omdb"] = {"api_key": self.omdb_key.text().strip()}
+        save_config(self.config)
+        try:
+            omdb.test_connection()
+            self.omdb_status.setText("✓ Connected to OMDb")
+        except omdb.OMDbError as error:
+            self.omdb_status.setText(f"❌ {error}")
+        finally:
+            self.config["omdb"] = old
+            save_config(self.config)
+
+    def test_anilist(self):
+        try:
+            anilist.test_connection()
+            self.anilist_status.setText("✓ Connected to AniList")
+        except anilist.AniListError as error:
+            self.anilist_status.setText(f"❌ {error}")
+
+    def refresh_ffmpeg_status(self):
+        path = shutil.which("ffprobe")
+        self.ffmpeg_status.setText(
+            f"✓ FFmpeg / ffprobe detected: {path}"
+            if path else
+            "Not detected — Rogue will still work, but duplicate inspection is limited."
+        )
+
+    def finish_setup(self):
+        self._save_entered_credentials()
+
+        # Require one usable general provider before marking onboarding complete.
+        has_general_provider = bool(
+            self.tmdb_token.text().strip()
+            or self.tvdb_key.text().strip()
+            or self.omdb_key.text().strip()
+        )
+        if not has_general_provider:
+            QMessageBox.warning(
+                self,
+                "Metadata Provider Required",
+                "Configure at least one of TMDB, TheTVDB, or OMDb before finishing setup. "
+                "AniList can still be used for anime.",
+            )
+            return
+
+        self.selected_mode = (
+            "advanced" if self.advanced_radio.isChecked() else "basic"
+        )
+        self.config.setdefault("ui", {})
+        self.config["ui"]["setup_complete"] = True
+        self.config["ui"]["preferred_mode"] = self.selected_mode
+        save_config(self.config)
+        self.accept()
+
+
 class SettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -536,6 +941,33 @@ class SettingsDialog(QDialog):
         anilist_test_button.clicked.connect(self.test_anilist_connection)
         layout.addWidget(anilist_test_button)
 
+        mode_title = QLabel("Interface")
+        mode_title.setStyleSheet(
+            "font-size: 20px; font-weight: bold; margin-top: 12px;"
+        )
+        layout.addWidget(mode_title)
+
+        mode_help = QLabel(
+            "Choose which interface Rogue opens by default. Basic keeps the "
+            "rename workflow simple; Advanced exposes the full toolset."
+        )
+        mode_help.setWordWrap(True)
+        mode_help.setStyleSheet("color: #aaaaaa;")
+        layout.addWidget(mode_help)
+
+        self.default_mode_combo = QComboBox()
+        self.default_mode_combo.addItem("Basic", "basic")
+        self.default_mode_combo.addItem("Advanced", "advanced")
+        saved_mode = self.config.get("ui", {}).get("preferred_mode", "basic")
+        mode_index = self.default_mode_combo.findData(saved_mode)
+        if mode_index >= 0:
+            self.default_mode_combo.setCurrentIndex(mode_index)
+        layout.addWidget(self.default_mode_combo)
+
+        rerun_setup_button = QPushButton("Run Setup Wizard Again")
+        rerun_setup_button.clicked.connect(self.run_setup_again)
+        layout.addWidget(rerun_setup_button)
+
         naming_title = QLabel("Naming Presets")
         naming_title.setStyleSheet(
             "font-size: 20px; font-weight: bold; margin-top: 12px;"
@@ -745,6 +1177,16 @@ class SettingsDialog(QDialog):
         buttons.addWidget(save_button)
 
         layout.addLayout(buttons)
+
+    def run_setup_again(self):
+        dialog = FirstRunSetupDialog(self)
+        dialog.setStyleSheet(dialog.styleSheet())
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.config = load_config()
+            mode = self.config.get("ui", {}).get("preferred_mode", "basic")
+            index = self.default_mode_combo.findData(mode)
+            if index >= 0:
+                self.default_mode_combo.setCurrentIndex(index)
 
     def choose_library_root(self, line_edit, title):
         current = line_edit.text().strip()
@@ -968,6 +1410,11 @@ class SettingsDialog(QDialog):
             "auto_accept_threshold": self.auto_accept_threshold.value(),
             "review_all_matches": self.review_all_checkbox.isChecked(),
         }
+
+        self.config.setdefault("ui", {})
+        self.config["ui"]["preferred_mode"] = (
+            self.default_mode_combo.currentData() or "basic"
+        )
 
         save_config(self.config)
 
@@ -2815,17 +3262,21 @@ class RogueRenamer(QMainWindow):
             self.open_settings
         )
 
-        history_button = QPushButton(
+        self.history_button = QPushButton(
             "History"
         )
-        history_button.clicked.connect(
+        self.history_button.clicked.connect(
             self.open_history
         )
 
+        self.mode_button = QPushButton()
+        self.mode_button.clicked.connect(self.toggle_mode)
+
         header.addLayout(titles)
         header.addStretch()
+        header.addWidget(self.mode_button)
         header.addWidget(
-            history_button
+            self.history_button
         )
         header.addWidget(
             settings_button
@@ -2939,12 +3390,12 @@ class RogueRenamer(QMainWindow):
         )
         controls.addWidget(self.provider_combo)
 
-        audit_button = QPushButton("Check Library")
-        audit_button.setToolTip(
+        self.audit_button = QPushButton("Check Library")
+        self.audit_button.setToolTip(
             "Scan an existing Movies or TV library for structural problems without changing files."
         )
-        audit_button.clicked.connect(self.open_library_audit)
-        controls.addWidget(audit_button)
+        self.audit_button.clicked.connect(self.open_library_audit)
+        controls.addWidget(self.audit_button)
 
         controls.addStretch()
 
@@ -3152,6 +3603,11 @@ class RogueRenamer(QMainWindow):
         )
 
         self.apply_styles()
+
+        self.current_mode = (
+            load_config().get("ui", {}).get("preferred_mode", "basic") or "basic"
+        )
+        self.apply_interface_mode()
 
     def apply_styles(self):
         self.setStyleSheet(
@@ -3514,6 +3970,36 @@ class RogueRenamer(QMainWindow):
         dialog = LibraryAuditDialog(folder, [], self)
         dialog.exec()
 
+    def apply_interface_mode(self):
+        """Show the simple rename workflow or Rogue's complete toolset."""
+        basic = self.current_mode == "basic"
+
+        # Basic keeps only the controls needed for add -> match -> review -> rename.
+        self.history_button.setVisible(not basic)
+        self.audit_button.setVisible(not basic)
+        self.undo_button.setVisible(not basic)
+
+        self.mode_button.setText(
+            "Switch to Advanced" if basic else "Switch to Basic"
+        )
+        self.setWindowTitle(
+            "Rogue Renamer — Basic" if basic else "Rogue Renamer — Advanced"
+        )
+
+    def toggle_mode(self):
+        self.current_mode = (
+            "advanced" if self.current_mode == "basic" else "basic"
+        )
+        config = load_config()
+        config.setdefault("ui", {})
+        config["ui"]["preferred_mode"] = self.current_mode
+        save_config(config)
+        self.apply_interface_mode()
+
+    def _basic_destination_path(self, original_path, proposed_name):
+        """Basic mode never moves media; it only renames beside the source."""
+        return Path(original_path).with_name(proposed_name)
+
     def open_settings(self):
         dialog = SettingsDialog(
             self
@@ -3525,6 +4011,11 @@ class RogueRenamer(QMainWindow):
 
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.refresh_proposed_filenames()
+            self.current_mode = (
+                load_config().get("ui", {}).get("preferred_mode", self.current_mode)
+                or self.current_mode
+            )
+            self.apply_interface_mode()
 
     def refresh_proposed_filenames(self):
         for row in range(self.table.rowCount()):
@@ -4806,6 +5297,13 @@ def main():
     app.setApplicationName(
         "Rogue Renamer"
     )
+
+    config = load_config()
+
+    if not config.get("ui", {}).get("setup_complete", False):
+        setup = FirstRunSetupDialog()
+        if setup.exec() != QDialog.DialogCode.Accepted:
+            return
 
     window = RogueRenamer()
 

@@ -36,6 +36,10 @@ DEFAULT_CONFIG = {
         "auto_accept_threshold": 90,
         "review_all_matches": False,
     },
+    "ui": {
+        "setup_complete": False,
+        "preferred_mode": "",
+    },
 }
 
 
@@ -99,6 +103,7 @@ def load_config():
         "naming": DEFAULT_CONFIG["naming"].copy(),
         "organization": DEFAULT_CONFIG["organization"].copy(),
         "automation": DEFAULT_CONFIG["automation"].copy(),
+        "ui": DEFAULT_CONFIG["ui"].copy(),
     }
 
     config_file = get_config_file()
@@ -130,6 +135,9 @@ def load_config():
 
         if isinstance(saved.get("automation"), dict):
             config["automation"].update(saved["automation"])
+
+        if isinstance(saved.get("ui"), dict):
+            config["ui"].update(saved["ui"])
 
         return config
 
