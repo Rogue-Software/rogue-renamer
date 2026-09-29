@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
 
 import requests
 
-from app.metadata import tvdb
+from app.metadata import tvdb, omdb
 
 from app.metadata.providers import (
     MetadataProviderError as TMDBError,
@@ -484,6 +484,35 @@ class SettingsDialog(QDialog):
         tvdb_test_button.clicked.connect(self.test_tvdb_connection)
         layout.addWidget(tvdb_test_button)
 
+        omdb_title = QLabel("OMDb")
+        omdb_title.setStyleSheet(
+            "font-size: 18px; font-weight: bold; margin-top: 12px;"
+        )
+        layout.addWidget(omdb_title)
+
+        omdb_help = QLabel(
+            "Enter your activated OMDb API key. Rogue only queries OMDb "
+            "when OMDb is selected as the metadata provider."
+        )
+        omdb_help.setWordWrap(True)
+        omdb_help.setStyleSheet("color: #aaaaaa;")
+        layout.addWidget(omdb_help)
+
+        omdb_config = self.config.get("omdb", {})
+        omdb_form = QFormLayout()
+        self.omdb_api_key_input = QLineEdit()
+        self.omdb_api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.omdb_api_key_input.setText(omdb_config.get("api_key", ""))
+        omdb_form.addRow("OMDb API Key:", self.omdb_api_key_input)
+        layout.addLayout(omdb_form)
+
+        self.omdb_connection_status = QLabel("OMDb connection not tested")
+        layout.addWidget(self.omdb_connection_status)
+
+        omdb_test_button = QPushButton("Test OMDb Connection")
+        omdb_test_button.clicked.connect(self.test_omdb_connection)
+        layout.addWidget(omdb_test_button)
+
         naming_title = QLabel("Naming Presets")
         naming_title.setStyleSheet(
             "font-size: 20px; font-weight: bold; margin-top: 12px;"
@@ -769,6 +798,27 @@ class SettingsDialog(QDialog):
             self.config["tvdb"] = old_tvdb
             save_config(self.config)
 
+    def test_omdb_connection(self):
+        key = self.omdb_api_key_input.text().strip()
+
+        if not key:
+            self.omdb_connection_status.setText("❌ Enter your OMDb API key.")
+            return
+
+        old_omdb = dict(self.config.get("omdb", {}))
+        self.config["omdb"] = {"api_key": key}
+        save_config(self.config)
+        try:
+            omdb.test_connection()
+            self.omdb_connection_status.setText(
+                "✓ Connected to OMDb successfully"
+            )
+        except omdb.OMDbError as error:
+            self.omdb_connection_status.setText(f"❌ {error}")
+        finally:
+            self.config["omdb"] = old_omdb
+            save_config(self.config)
+
     def save_settings(self):
         self.config["tmdb"] = {
             "access_token":
@@ -785,6 +835,10 @@ class SettingsDialog(QDialog):
         self.config["tvdb"] = {
             "api_key": self.tvdb_api_key_input.text().strip(),
             "pin": self.tvdb_pin_input.text().strip(),
+        }
+
+        self.config["omdb"] = {
+            "api_key": self.omdb_api_key_input.text().strip(),
         }
 
         movie_template = (

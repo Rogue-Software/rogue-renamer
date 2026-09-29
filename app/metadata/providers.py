@@ -1,4 +1,4 @@
-from app.metadata import tmdb, tvdb
+from app.metadata import tmdb, tvdb, omdb
 from app.settings import load_config, save_config
 
 
@@ -14,6 +14,10 @@ PROVIDERS = {
     "tvdb": {
         "id": "tvdb",
         "name": "TheTVDB",
+    },
+    "omdb": {
+        "id": "omdb",
+        "name": "OMDb",
     },
 }
 
@@ -56,7 +60,9 @@ def _call(function_name, *args, **kwargs):
             return getattr(tmdb, function_name)(*args, **kwargs)
         if provider_id == "tvdb":
             return getattr(tvdb, function_name)(*args, **kwargs)
-    except (tmdb.TMDBError, tvdb.TVDBError) as error:
+        if provider_id == "omdb":
+            return getattr(omdb, function_name)(*args, **kwargs)
+    except (tmdb.TMDBError, tvdb.TVDBError, omdb.OMDbError) as error:
         raise MetadataProviderError(str(error)) from error
 
     raise MetadataProviderError(

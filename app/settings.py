@@ -15,6 +15,9 @@ DEFAULT_CONFIG = {
         "api_key": "",
         "pin": "",
     },
+    "omdb": {
+        "api_key": "",
+    },
     "metadata": {
         "provider": "tmdb",
     },
@@ -91,6 +94,7 @@ def load_config():
     config = {
         "tmdb": DEFAULT_CONFIG["tmdb"].copy(),
         "tvdb": DEFAULT_CONFIG["tvdb"].copy(),
+        "omdb": DEFAULT_CONFIG["omdb"].copy(),
         "metadata": DEFAULT_CONFIG["metadata"].copy(),
         "naming": DEFAULT_CONFIG["naming"].copy(),
         "organization": DEFAULT_CONFIG["organization"].copy(),
@@ -111,6 +115,9 @@ def load_config():
 
         if isinstance(saved.get("tvdb"), dict):
             config["tvdb"].update(saved["tvdb"])
+
+        if isinstance(saved.get("omdb"), dict):
+            config["omdb"].update(saved["omdb"])
 
         if isinstance(saved.get("metadata"), dict):
             config["metadata"].update(saved["metadata"])
