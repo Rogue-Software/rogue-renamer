@@ -11,6 +11,13 @@ DEFAULT_CONFIG = {
         "access_token": "",
         "api_key": "",
     },
+    "tvdb": {
+        "api_key": "",
+        "pin": "",
+    },
+    "metadata": {
+        "provider": "tmdb",
+    },
     "naming": {
         "movie_template": "{title} ({year})",
         "tv_template": "{title} - S{season:02d}E{episode:02d} - {episode_title}",
@@ -83,6 +90,8 @@ def save_rename_history(history):
 def load_config():
     config = {
         "tmdb": DEFAULT_CONFIG["tmdb"].copy(),
+        "tvdb": DEFAULT_CONFIG["tvdb"].copy(),
+        "metadata": DEFAULT_CONFIG["metadata"].copy(),
         "naming": DEFAULT_CONFIG["naming"].copy(),
         "organization": DEFAULT_CONFIG["organization"].copy(),
         "automation": DEFAULT_CONFIG["automation"].copy(),
@@ -99,6 +108,12 @@ def load_config():
 
         if isinstance(saved.get("tmdb"), dict):
             config["tmdb"].update(saved["tmdb"])
+
+        if isinstance(saved.get("tvdb"), dict):
+            config["tvdb"].update(saved["tvdb"])
+
+        if isinstance(saved.get("metadata"), dict):
+            config["metadata"].update(saved["metadata"])
 
         if isinstance(saved.get("naming"), dict):
             config["naming"].update(saved["naming"])

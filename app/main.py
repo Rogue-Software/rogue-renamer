@@ -3,8 +3,12 @@ import sys
 import uuid
 from datetime import datetime
 from pathlib import Path
+import re
+import subprocess
+import json
+import shutil
 
-from PySide6.QtCore import Qt, QByteArray
+from PySide6.QtCore import Qt, QByteArray, QObject, QThread, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -30,15 +34,22 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QVBoxLayout,
     QWidget,
+    QScrollArea,
 )
 
 import requests
 
-from app.metadata.tmdb import (
-    TMDBError,
+from app.metadata import tvdb
+
+from app.metadata.providers import (
+    MetadataProviderError as TMDBError,
+    available_providers,
+    get_active_provider_id,
+    get_active_provider_name,
     get_tv_episode,
     get_tv_season,
     match_media,
+    set_active_provider,
 )
 from app.parser import (
     COMPANION_EXTENSIONS,
@@ -134,6 +145,7 @@ def build_destination_path(original_path, match, proposed_name):
             "title": match.get("title", ""),
             "year": match.get("year") or "",
             "tmdb_id": match.get("id") or "",
+            "provider_id": match.get("id") or "",
         }
         relative_folder = render_folder_template(
             organization["movie_folder_template"],
@@ -149,6 +161,7 @@ def build_destination_path(original_path, match, proposed_name):
             "episode_code": format_episode_code(match),
             "episode_title": match.get("episode_title") or "",
             "tmdb_id": match.get("id") or "",
+            "provider_id": match.get("id") or "",
         }
         relative_folder = render_folder_template(
             organization["tv_folder_template"],
@@ -223,6 +236,7 @@ def build_proposed_filename(
             "title": match.get("title", ""),
             "year": match.get("year") or "",
             "tmdb_id": match.get("id") or "",
+            "provider_id": match.get("id") or "",
         }
         filename = render_naming_template(movie_template, values)
     else:
@@ -236,6 +250,7 @@ def build_proposed_filename(
             "episode_code": format_episode_code(match),
             "episode_title": match.get("episode_title") or "",
             "tmdb_id": match.get("id") or "",
+            "provider_id": match.get("id") or "",
         }
 
         # Preserve the user's existing preset for single episodes. For
@@ -336,10 +351,49 @@ class SettingsDialog(QDialog):
             }
         """)
 
-        layout = QVBoxLayout(self)
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(8, 8, 8, 8)
+
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+
+        # QScrollArea creates its own viewport/content surface. Explicitly
+        # keep those surfaces on Rogue's dark palette instead of allowing
+        # the native Windows light background to show through.
+        scroll.setStyleSheet("""
+            QScrollArea {
+                background-color: #14171a;
+                border: none;
+            }
+            QScrollArea > QWidget > QWidget {
+                background-color: #14171a;
+            }
+        """)
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+
+        scroll_content = QWidget()
+        scroll_content.setObjectName("settingsScrollContent")
+        scroll_content.setStyleSheet("""
+            QWidget#settingsScrollContent {
+                background-color: #14171a;
+            }
+            QWidget#settingsScrollContent QLabel {
+                background-color: transparent;
+            }
+        """)
+        layout = QVBoxLayout(scroll_content)
+        layout.setContentsMargins(12, 12, 12, 12)
+
+        scroll.setWidget(scroll_content)
+        outer_layout.addWidget(scroll)
 
         title = QLabel(
-            "TMDB Metadata Provider"
+            "Metadata Providers"
         )
 
         title.setStyleSheet(
@@ -393,6 +447,42 @@ class SettingsDialog(QDialog):
         )
 
         layout.addLayout(form)
+
+        tvdb_title = QLabel("TheTVDB")
+        tvdb_title.setStyleSheet(
+            "font-size: 18px; font-weight: bold; margin-top: 12px;"
+        )
+        layout.addWidget(tvdb_title)
+
+        tvdb_help = QLabel(
+            "Enter your TheTVDB v4 project API key. PIN is optional and is only "
+            "needed for user-supported keys that require a subscriber PIN."
+        )
+        tvdb_help.setWordWrap(True)
+        tvdb_help.setStyleSheet("color: #aaaaaa;")
+        layout.addWidget(tvdb_help)
+
+        tvdb = self.config.get("tvdb", {})
+        tvdb_form = QFormLayout()
+
+        self.tvdb_api_key_input = QLineEdit()
+        self.tvdb_api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.tvdb_api_key_input.setText(tvdb.get("api_key", ""))
+
+        self.tvdb_pin_input = QLineEdit()
+        self.tvdb_pin_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.tvdb_pin_input.setText(tvdb.get("pin", ""))
+
+        tvdb_form.addRow("TVDB API Key:", self.tvdb_api_key_input)
+        tvdb_form.addRow("TVDB PIN (optional):", self.tvdb_pin_input)
+        layout.addLayout(tvdb_form)
+
+        self.tvdb_connection_status = QLabel("TheTVDB connection not tested")
+        layout.addWidget(self.tvdb_connection_status)
+
+        tvdb_test_button = QPushButton("Test TheTVDB Connection")
+        tvdb_test_button.clicked.connect(self.test_tvdb_connection)
+        layout.addWidget(tvdb_test_button)
 
         naming_title = QLabel("Naming Presets")
         naming_title.setStyleSheet(
@@ -656,6 +746,29 @@ class SettingsDialog(QDialog):
                 "❌ Could not connect to TMDB"
             )
 
+    def test_tvdb_connection(self):
+        key = self.tvdb_api_key_input.text().strip()
+        pin = self.tvdb_pin_input.text().strip()
+
+        if not key:
+            self.tvdb_connection_status.setText("❌ Enter your TheTVDB API key.")
+            return
+
+        # Test the unsaved values without writing them permanently first.
+        old_tvdb = dict(self.config.get("tvdb", {}))
+        self.config["tvdb"] = {"api_key": key, "pin": pin}
+        save_config(self.config)
+        try:
+            tvdb.test_connection()
+            self.tvdb_connection_status.setText(
+                "✓ Connected to TheTVDB successfully"
+            )
+        except tvdb.TVDBError as error:
+            self.tvdb_connection_status.setText(f"❌ {error}")
+        finally:
+            self.config["tvdb"] = old_tvdb
+            save_config(self.config)
+
     def save_settings(self):
         self.config["tmdb"] = {
             "access_token":
@@ -667,6 +780,11 @@ class SettingsDialog(QDialog):
                 self.api_key_input
                 .text()
                 .strip(),
+        }
+
+        self.config["tvdb"] = {
+            "api_key": self.tvdb_api_key_input.text().strip(),
+            "pin": self.tvdb_pin_input.text().strip(),
         }
 
         movie_template = (
@@ -830,6 +948,7 @@ class MatchSelectionDialog(QDialog):
             countries = candidate.get("origin_country") or []
             country_text = f" • {', '.join(countries)}" if countries else ""
 
+            provider_name = candidate.get("provider_name") or get_active_provider_name()
             if candidate["type"] == "TV":
                 state = (
                     format_episode_code(candidate)
@@ -838,12 +957,12 @@ class MatchSelectionDialog(QDialog):
                 )
                 detail = (
                     f"{title} ({year}){country_text}\n"
-                    f"TMDB #{candidate.get('id', '?')}   •   {state}   •   Score {score}"
+                    f"{provider_name} #{candidate.get('id', '?')}   •   {state}   •   Score {score}"
                 )
             else:
                 detail = (
                     f"{title} ({year}){country_text}\n"
-                    f"TMDB #{candidate.get('id', '?')}   •   Score {score}"
+                    f"{provider_name} #{candidate.get('id', '?')}   •   Score {score}"
                 )
 
             item = QListWidgetItem(detail)
@@ -921,19 +1040,21 @@ class MatchSelectionDialog(QDialog):
 
     def load_poster(self, candidate):
         poster_path = candidate.get("poster_path")
-        if not poster_path:
+        poster_url = candidate.get("poster_url")
+        poster_key = poster_url or poster_path
+        if not poster_key:
             self.poster.setPixmap(QPixmap())
             self.poster.setText("No poster available")
             return
 
-        pixmap = self.poster_cache.get(poster_path)
+        pixmap = self.poster_cache.get(poster_key)
         if pixmap is None:
             self.poster.setPixmap(QPixmap())
             self.poster.setText("Loading poster…")
             QApplication.processEvents()
             try:
                 response = requests.get(
-                    f"https://image.tmdb.org/t/p/w342{poster_path}",
+                    (poster_url or f"https://image.tmdb.org/t/p/w342{poster_path}"),
                     timeout=8,
                 )
                 response.raise_for_status()
@@ -941,7 +1062,7 @@ class MatchSelectionDialog(QDialog):
                 if not pixmap.loadFromData(QByteArray(response.content)):
                     pixmap = None
                 if pixmap is not None:
-                    self.poster_cache[poster_path] = pixmap
+                    self.poster_cache[poster_key] = pixmap
             except requests.RequestException:
                 pixmap = None
 
@@ -967,7 +1088,8 @@ class MatchSelectionDialog(QDialog):
         title = candidate.get("title", "Unknown")
         original_title = candidate.get("original_title") or ""
         year = candidate.get("year") or "Unknown"
-        tmdb_id = candidate.get("id", "?")
+        provider_id = candidate.get("id", "?")
+        provider_name = candidate.get("provider_name") or get_active_provider_name()
         score = candidate.get("score", 0)
         language = (candidate.get("original_language") or "Unknown").upper()
         countries = candidate.get("origin_country") or []
@@ -995,7 +1117,7 @@ class MatchSelectionDialog(QDialog):
             )
 
         self.detail_meta.setText(
-            f"<b>TMDB ID:</b> {tmdb_id}<br>"
+            f"<b>{provider_name} ID:</b> {provider_id}<br>"
             f"<b>{date_label}:</b> {date_value}<br>"
             f"<b>Country:</b> {country_text}<br>"
             f"<b>Original language:</b> {language}<br>"
@@ -1541,17 +1663,68 @@ def audit_library(root_path):
     return findings
 
 
-def add_tmdb_audit_findings(root_path, findings):
-    """Add read-only online TMDB verification to structural audit results."""
+
+class LibraryMetadataCache:
+    """Per-check metadata cache: one show match and one season fetch per key."""
+
+    def __init__(self):
+        self.matches = {}
+        self.seasons = {}
+
+    def match(self, parsed):
+        key = (
+            (parsed.get("title") or "").strip().casefold(),
+            parsed.get("year"),
+            (parsed.get("country_hint") or "").strip().casefold(),
+        )
+        if key not in self.matches:
+            self.matches[key] = match_media(parsed)
+        return self.matches[key]
+
+    def season(self, series_id, season_number):
+        key = (series_id, int(season_number))
+        if key not in self.seasons:
+            self.seasons[key] = get_tv_season(series_id, season_number)
+        return self.seasons[key]
+
+
+def build_library_inventory(root_path):
+    """Walk and parse primary media once for Library Check."""
     root = Path(root_path)
-    media_paths = sorted(
-        (p for p in root.rglob("*")
-         if p.is_file() and p.suffix.lower() in MEDIA_EXTENSIONS and not is_extra_video(p)),
-        key=lambda p: str(p).casefold(),
-    )
+    inventory = []
+    companions = []
+
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        suffix = path.suffix.lower()
+        if suffix in MEDIA_EXTENSIONS:
+            inventory.append({
+                "path": path,
+                "is_extra": is_extra_video(path),
+                "parsed": parse_media_path(str(path)),
+            })
+        elif suffix in COMPANION_EXTENSIONS:
+            companions.append(path)
+
+    inventory.sort(key=lambda item: str(item["path"]).casefold())
+    companions.sort(key=lambda item: str(item).casefold())
+    return inventory, companions
+
+def add_tmdb_audit_findings(root_path, findings, inventory=None, metadata_cache=None):
+    """Add read-only online metadata verification to structural audit results."""
+    root = Path(root_path)
+    metadata_cache = metadata_cache or LibraryMetadataCache()
+
+    if inventory is None:
+        inventory, _companions = build_library_inventory(root)
+
     groups = {}
-    for path in media_paths:
-        parsed = parse_media_path(str(path))
+    for item in inventory:
+        if item.get("is_extra"):
+            continue
+        path = item["path"]
+        parsed = item["parsed"]
         if parsed.get("type") != "TV":
             continue
         key = ((parsed.get("title") or "").casefold(),
@@ -1563,22 +1736,22 @@ def add_tmdb_audit_findings(root_path, findings):
         rep = records[0]
         parsed = rep["parsed"]
         try:
-            match = match_media(parsed)
+            match = metadata_cache.match(parsed)
         except TMDBError as error:
-            findings.append({"severity":"Warning","category":"TMDB Audit",
-                "path":str(rep["path"]),"message":f"TMDB verification could not be completed: {error}"})
+            findings.append({"severity":"Warning","category":"Metadata Audit",
+                "path":str(rep["path"]),"message":f"Metadata verification could not be completed: {error}"})
             continue
 
         if not match:
-            findings.append({"severity":"Problem","category":"TMDB Match",
-                "path":str(rep["path"]),"message":f'No TMDB match was found for "{parsed.get("title","Unknown")}".'})
+            findings.append({"severity":"Problem","category":"Metadata Match",
+                "path":str(rep["path"]),"message":f'No metadata match was found for "{parsed.get("title","Unknown")}".'})
             continue
 
         if match.get("confidence") == "Review":
             reason=match.get("ambiguity_reason") or "match requires review"
-            findings.append({"severity":"Warning","category":"TMDB Match",
+            findings.append({"severity":"Warning","category":"Metadata Match",
                 "path":str(rep["path"]),
-                "message":f'TMDB match for "{parsed.get("title","Unknown")}" is ambiguous: '
+                "message":f'Metadata match for "{parsed.get("title","Unknown")}" is ambiguous: '
                           f'{match.get("title","Unknown")} ({match.get("year") or "unknown year"}), '
                           f'score {match.get("score",0)}/100 — {reason}. Gap checks skipped.'})
             continue
@@ -1596,9 +1769,9 @@ def add_tmdb_audit_findings(root_path, findings):
 
         for season, local_eps in sorted(local.items()):
             try:
-                sd=get_tv_season(tid,season)
+                sd=metadata_cache.season(tid,season)
             except TMDBError as error:
-                findings.append({"severity":"Warning","category":"TMDB Season",
+                findings.append({"severity":"Warning","category":"Metadata Season",
                     "path":str(rep["path"]),"message":f"Could not verify {title} Season {season:02d}: {error}"})
                 continue
 
@@ -1608,7 +1781,7 @@ def add_tmdb_audit_findings(root_path, findings):
             for ep in invalid:
                 for path in ep_paths.get((season,ep),[rep["path"]]):
                     findings.append({"severity":"Problem","category":"Invalid Episode","path":str(path),
-                        "message":f"{title} S{season:02d}E{ep:02d} does not exist in this TMDB season."})
+                        "message":f"{title} S{season:02d}E{ep:02d} does not exist in this metadata season."})
 
             # Only call gaps missing through the highest local episode. This avoids
             # flagging the uncollected remainder of a season.
@@ -1620,14 +1793,14 @@ def add_tmdb_audit_findings(root_path, findings):
                 findings.append({"severity":"Warning","category":"Missing Episode",
                     "path":str(rep["path"].parent),
                     "message":f"{title} Season {season:02d} has local episodes through E{highest:02d}, "
-                              f"but {codes} {'is' if len(missing)==1 else 'are'} missing according to TMDB."})
+                              f"but {codes} {'is' if len(missing)==1 else 'are'} missing according to the selected metadata provider."})
 
             valid=len(local_eps & set(remote))
             if valid and not invalid:
-                findings.append({"severity":"OK","category":"TMDB Verified",
+                findings.append({"severity":"OK","category":"Metadata Verified",
                     "path":str(rep["path"].parent),
                     "message":f"{title} Season {season:02d}: {valid} local episode"
-                              f"{'s' if valid != 1 else ''} verified against TMDB."})
+                              f"{'s' if valid != 1 else ''} verified against the selected metadata provider."})
 
     order={"Problem":0,"Warning":1,"OK":2}
     findings.sort(key=lambda x:(order.get(x["severity"],9),x["category"].casefold(),x["path"].casefold()))
@@ -1635,58 +1808,56 @@ def add_tmdb_audit_findings(root_path, findings):
 
 
 
-def collect_verified_tv_matches(root_path):
-    """Learn unique High-confidence TV identities from files in this audit tree."""
+def collect_verified_tv_matches(root_path, inventory=None, metadata_cache=None):
+    """Learn one safe High-confidence TV identity per parsed title.
+
+    Performance rule: never metadata-match every episode in a library.
+    Pick the strongest representative filename for each title and perform
+    at most one match request per unique parsed title.
+    """
     root = Path(root_path)
-    identities = {}
+    metadata_cache = metadata_cache or LibraryMetadataCache()
+    if inventory is None:
+        inventory, _companions = build_library_inventory(root)
 
-    media_paths = sorted(
-        (
-            p for p in root.rglob("*")
-            if p.is_file()
-            and p.suffix.lower() in MEDIA_EXTENSIONS
-            and not is_extra_video(p)
-        ),
-        key=lambda p: str(p).casefold(),
-    )
+    best_by_title = {}
 
-    # Stronger filenames first: year/country hints can disambiguate titles such
-    # as The Office or Doctor Who, then the verified identity can safely help
-    # weaker filenames with the same parsed title.
-    parsed_items = []
-    for path in media_paths:
-        parsed = parse_media_path(str(path))
+    for item in inventory:
+        if item.get("is_extra"):
+            continue
+        path = item["path"]
+        parsed = item["parsed"]
         if parsed.get("type") != "TV":
             continue
-        strength = int(bool(parsed.get("year"))) + int(bool(parsed.get("country_hint")))
-        parsed_items.append((strength, path, parsed))
 
-    parsed_items.sort(key=lambda item: (-item[0], str(item[1]).casefold()))
-
-    candidates_by_title = {}
-    for _strength, _path, parsed in parsed_items:
         title_key = (parsed.get("title") or "").strip().casefold()
         if not title_key:
             continue
+
+        strength = (
+            4 * int(bool(parsed.get("year")))
+            + 2 * int(bool(parsed.get("country_hint")))
+            + int(bool(parsed.get("folder_season")))
+        )
+
+        current = best_by_title.get(title_key)
+        if current is None or strength > current[0]:
+            best_by_title[title_key] = (strength, parsed)
+
+    identities = {}
+    for title_key, (_strength, parsed) in best_by_title.items():
         try:
-            match = match_media(parsed)
+            match = metadata_cache.match(parsed)
         except Exception:
             continue
-        if not match or match.get("confidence") != "High" or not match.get("id"):
-            continue
 
-        candidates_by_title.setdefault(title_key, {})[match["id"]] = match
-
-    # Only trust a title-wide identity when every High-confidence observation
-    # agrees on the same TMDB series.
-    for title_key, by_id in candidates_by_title.items():
-        if len(by_id) == 1:
-            identities[title_key] = next(iter(by_id.values()))
+        if match and match.get("confidence") == "High" and match.get("id"):
+            identities[title_key] = match
 
     return identities
 
 
-def build_audit_fix_plan(root_path, finding, verified_tv_matches=None):
+def build_audit_fix_plan(root_path, finding, verified_tv_matches=None, metadata_cache=None):
     """Build one conservative read-only suggested correction."""
     category=finding.get("category","")
     source=Path(finding.get("path",""))
@@ -1739,8 +1910,20 @@ def build_audit_fix_plan(root_path, finding, verified_tv_matches=None):
             if season is not None and all(ep is not None for ep in episodes):
                 episode_details = []
                 try:
+                    if metadata_cache is not None:
+                        season_data = metadata_cache.season(verified["id"], season)
+                        season_index = {
+                            int(item["episode_number"]): item
+                            for item in (season_data.get("episodes") or [])
+                            if item.get("episode_number") is not None
+                        }
+                    else:
+                        season_index = {}
+
                     for ep in episodes:
-                        data = get_tv_episode(verified["id"], season, ep)
+                        data = season_index.get(int(ep)) if metadata_cache is not None else None
+                        if data is None and metadata_cache is None:
+                            data = get_tv_episode(verified["id"], season, ep)
                         if not data:
                             raise TMDBError(
                                 f"S{season:02d}E{ep:02d} was not found for "
@@ -1838,186 +2021,603 @@ def build_audit_fix_plan(root_path, finding, verified_tv_matches=None):
     return plan
 
 
+class LibraryCheckWorker(QObject):
+    finished = Signal(object, object, object)
+    failed = Signal(str)
+    progress = Signal(str)
+
+    def __init__(self, root_path):
+        super().__init__()
+        self.root_path = str(root_path)
+
+    def run(self):
+        try:
+            self.progress.emit("Scanning files locally…")
+            inventory, _companions = build_library_inventory(self.root_path)
+            findings = audit_library(self.root_path)
+
+            cache = LibraryMetadataCache()
+            self.progress.emit(
+                f"Local scan complete — {len(inventory)} media files. Checking metadata…"
+            )
+            add_tmdb_audit_findings(
+                self.root_path,
+                findings,
+                inventory=inventory,
+                metadata_cache=cache,
+            )
+
+            self.progress.emit("Preparing safe fixes from cached metadata…")
+            verified = collect_verified_tv_matches(
+                self.root_path,
+                inventory=inventory,
+                metadata_cache=cache,
+            )
+
+            fix_plans = {}
+            for finding in findings:
+                if finding.get("severity") == "OK":
+                    continue
+                try:
+                    plan = build_audit_fix_plan(
+                        self.root_path,
+                        finding,
+                        verified,
+                        metadata_cache=cache,
+                    )
+                except Exception as error:
+                    plan = {
+                        "available": False,
+                        "reason": f"Could not prepare a repair: {error}",
+                    }
+
+                if plan.get("available"):
+                    key = (
+                        finding.get("category", ""),
+                        finding.get("path", ""),
+                        finding.get("message", ""),
+                    )
+                    fix_plans[key] = plan
+
+            self.finished.emit(findings, verified, fix_plans)
+        except Exception as error:
+            self.failed.emit(f"{type(error).__name__}: {error}")
+
+
 class LibraryAuditDialog(QDialog):
+    """Simple library health/check UI over Rogue's existing audit/repair engine."""
+
     def __init__(self, root_path, findings, parent=None):
         super().__init__(parent)
         self.root_path = str(root_path)
         self.findings = findings
-        self.current_fix_plan = None
-        self.current_fix_finding = None
         self.verified_tv_matches = {}
+        self.fix_plans = {}
+        self.show_correct = False
 
-        self.setWindowTitle("Rogue Renamer — Library Audit")
-        self.resize(1180, 720)
-        self.setMinimumSize(820, 520)
+        self.setWindowTitle("Rogue Renamer — Library Check")
+        self.resize(1180, 760)
+        self.setMinimumSize(860, 580)
 
         layout = QVBoxLayout(self)
 
-        heading = QLabel("LIBRARY AUDIT")
-        heading.setStyleSheet("font-size: 22px; font-weight: bold;")
+        heading = QLabel("Check Library")
+        heading.setStyleSheet("font-size:24px; font-weight:bold;")
         layout.addWidget(heading)
 
-        root_label = QLabel(f"Read-only scan: {self.root_path}")
-        root_label.setWordWrap(True)
-        root_label.setStyleSheet("color: #aaaaaa;")
-        layout.addWidget(root_label)
-
-        summary = QHBoxLayout()
-        self.summary_label = QLabel()
-        self.summary_label.setStyleSheet("font-weight: bold;")
-        summary.addWidget(self.summary_label)
-        summary.addStretch()
-
-        summary.addWidget(QLabel("Show:"))
-        self.filter_combo = QComboBox()
-        self.filter_combo.addItems(["All", "Problems", "Warnings", "OK"])
-        self.filter_combo.currentTextChanged.connect(self.populate)
-        summary.addWidget(self.filter_combo)
-
-        self.tmdb_button = QPushButton("Verify with TMDB")
-        self.tmdb_button.setToolTip(
-            "Verify TV episodes and detect gaps using live TMDB metadata. This remains read-only."
+        self.summary_label = QLabel("Checking your library…")
+        self.summary_label.setWordWrap(True)
+        self.summary_label.setStyleSheet(
+            "font-size:16px; padding:10px; background:#1d2024; "
+            "border:1px solid #444; border-radius:5px;"
         )
-        self.tmdb_button.clicked.connect(self.verify_with_tmdb)
-        summary.addWidget(self.tmdb_button)
+        layout.addWidget(self.summary_label)
 
-        self.fix_plan_button = QPushButton("Suggest Fix")
-        self.fix_plan_button.setToolTip(
-            "Show a read-only suggested correction for the selected finding. No files will be changed."
-        )
-        self.fix_plan_button.clicked.connect(self.suggest_selected_fix)
-        summary.addWidget(self.fix_plan_button)
+        controls = QHBoxLayout()
+        self.show_correct_checkbox = QCheckBox("Show correct files")
+        self.show_correct_checkbox.setChecked(False)
+        self.show_correct_checkbox.stateChanged.connect(self.toggle_correct_files)
+        controls.addWidget(self.show_correct_checkbox)
+        controls.addStretch()
 
-        self.apply_fix_button = QPushButton("Apply Selected Fix")
-        self.apply_fix_button.setToolTip(
-            "Apply the currently suggested High-confidence repair using "
-            "Rogue's normal confirmation, collision, History and Undo safeguards."
-        )
-        self.apply_fix_button.setEnabled(False)
-        self.apply_fix_button.clicked.connect(self.apply_selected_fix)
-        summary.addWidget(self.apply_fix_button)
+        self.fix_button = QPushButton("Fix Selected")
+        self.fix_button.setEnabled(False)
+        self.fix_button.clicked.connect(self.apply_selected_fix)
+        controls.addWidget(self.fix_button)
 
-        layout.addLayout(summary)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.reject)
+        controls.addWidget(close_button)
+        layout.addLayout(controls)
 
         self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(
-            ["Status", "Category", "File", "Finding"]
-        )
-        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setHorizontalHeaderLabels(["Status", "File", "Issue", "Action"])
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
 
-        header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        self.table.setColumnWidth(0, 90)
+        # Keep the selected finding visually obvious across the entire row.
+        # Some platform/theme combinations make the default selected-row
+        # background almost indistinguishable from the table background.
+        self.table.setStyleSheet("""
+            QTableWidget {
+                selection-background-color: #3b4654;
+                selection-color: #ffffff;
+            }
+            QTableWidget::item:selected {
+                background: #3b4654;
+                color: #ffffff;
+            }
+        """)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.itemSelectionChanged.connect(self.update_details)
+        layout.addWidget(self.table, 3)
 
-        layout.addWidget(self.table, 1)
-
-        details_heading = QLabel("Finding Details")
-        details_heading.setStyleSheet("font-weight: bold; margin-top: 6px;")
-        layout.addWidget(details_heading)
+        detail_heading = QLabel("Details")
+        detail_heading.setStyleSheet("font-size:17px; font-weight:bold;")
+        layout.addWidget(detail_heading)
 
         self.details = QTextEdit()
         self.details.setReadOnly(True)
-        self.details.setMinimumHeight(155)
-        self.details.setMaximumHeight(250)
         self.details.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
-        self.details.setStyleSheet("""
-            QTextEdit {
-                background: #1d2024;
-                color: #eeeeee;
-                border: 1px solid #444;
-                padding: 8px;
-            }
-        """)
-        self.details.setPlaceholderText(
-            "Select a finding above to see its full path and explanation."
+        self.details.setStyleSheet(
+            "QTextEdit { background:#1d2024; color:#eee; border:1px solid #444; padding:8px; }"
         )
-        layout.addWidget(self.details)
+        layout.addWidget(self.details, 2)
 
-        self.table.itemSelectionChanged.connect(self.update_details)
+        self.worker_thread = None
+        self.worker = None
 
-        note = QLabel(
-            "Audit Mode is read-only. It does not rename, move, create, or delete files."
-        )
-        note.setStyleSheet("color: #aaaaaa;")
-        layout.addWidget(note)
-
-        buttons = QHBoxLayout()
-        buttons.addStretch()
-        close_button = QPushButton("Close")
-        close_button.clicked.connect(self.accept)
-        buttons.addWidget(close_button)
-        layout.addLayout(buttons)
-
+        # Show the window first. Heavy filesystem/API work runs on a worker
+        # thread so the GUI stays responsive.
         self.populate()
+        self.start_background_check()
 
+    def finding_key(self, finding):
+        return (
+            finding.get("category", ""),
+            finding.get("path", ""),
+            finding.get("message", ""),
+        )
 
-
-    def suggest_selected_fix(self):
-        rows=self.table.selectionModel().selectedRows()
-        if not rows:
-            QMessageBox.information(self,"Suggest Fix","Select an audit finding first.")
+    def start_background_check(self):
+        if self.worker_thread and self.worker_thread.isRunning():
             return
 
-        item=self.table.item(rows[0].row(),0)
-        finding=item.data(Qt.ItemDataRole.UserRole) if item else None
+        self.fix_button.setEnabled(False)
+        self.summary_label.setText("Checking library…")
+        self.details.setPlainText(
+            "Rogue is scanning the library in the background. "
+            "You can move or resize this window while it works."
+        )
+
+        self.worker_thread = QThread(self)
+        self.worker = LibraryCheckWorker(self.root_path)
+        self.worker.moveToThread(self.worker_thread)
+
+        self.worker_thread.started.connect(self.worker.run)
+        self.worker.progress.connect(self.on_check_progress)
+        self.worker.finished.connect(self.on_check_finished)
+        self.worker.failed.connect(self.on_check_failed)
+
+        self.worker.finished.connect(self.worker_thread.quit)
+        self.worker.failed.connect(self.worker_thread.quit)
+        self.worker_thread.finished.connect(self.worker.deleteLater)
+        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
+        self.worker_thread.finished.connect(self.clear_worker_refs)
+
+        self.worker_thread.start()
+
+    def clear_worker_refs(self):
+        self.worker = None
+        self.worker_thread = None
+
+    def on_check_progress(self, message):
+        self.summary_label.setText(message)
+
+    def on_check_finished(self, findings, verified, fix_plans):
+        self.findings = findings
+        self.verified_tv_matches = verified
+        self.fix_plans = fix_plans
+        self.populate()
+
+    def on_check_failed(self, message):
+        self.summary_label.setText("Library check could not be completed.")
+        self.details.setPlainText(message)
+        self.fix_button.setEnabled(False)
+
+    def classify_finding(self, finding):
+        if finding.get("severity") == "OK":
+            return "Correct", "—"
+
+        plan = self.fix_plans.get(self.finding_key(finding))
+        if plan and plan.get("available"):
+            return "Safe to Fix", "Fix"
+
+        category = finding.get("category", "")
+        if category == "Missing Episode":
+            return "Missing", "—"
+        return "Needs Review", "Review"
+
+    def visible_findings(self):
+        if self.show_correct:
+            return list(self.findings)
+        return [f for f in self.findings if f.get("severity") != "OK"]
+
+    def update_summary(self):
+        safe = review = missing = correct = 0
+        for finding in self.findings:
+            status, _action = self.classify_finding(finding)
+            if status == "Safe to Fix":
+                safe += 1
+            elif status == "Missing":
+                missing += 1
+            elif status == "Correct":
+                correct += 1
+            else:
+                review += 1
+
+        provider = get_active_provider_name()
+        self.summary_label.setText(
+            f"Library Check Complete — {safe} safe fix"
+            f"{'es' if safe != 1 else ''} • "
+            f"{review} need review • {missing} missing • "
+            f"{correct} correct\nMetadata provider: {provider}"
+        )
+
+    def populate(self, selected_key=None):
+        rows = self.visible_findings()
+        self.table.setRowCount(len(rows))
+        selected_row = None
+
+        for row, finding in enumerate(rows):
+            status, action = self.classify_finding(finding)
+            path = Path(finding.get("path", ""))
+            try:
+                display_path = str(path.relative_to(Path(self.root_path)))
+            except ValueError:
+                display_path = str(path)
+
+            status_item = QTableWidgetItem(status)
+            status_item.setData(Qt.ItemDataRole.UserRole, finding)
+            self.table.setItem(row, 0, status_item)
+            self.table.setItem(row, 1, QTableWidgetItem(display_path))
+            self.table.setItem(row, 2, QTableWidgetItem(finding.get("message", "")))
+            self.table.setItem(row, 3, QTableWidgetItem(action))
+
+            if selected_key and self.finding_key(finding) == selected_key:
+                selected_row = row
+
+        self.update_summary()
+
+        if self.table.rowCount():
+            row = selected_row if selected_row is not None else 0
+            self.table.selectRow(row)
+            item = self.table.item(row, 0)
+            if item:
+                self.table.scrollToItem(item)
+        else:
+            self.details.setPlainText(
+                "No issues were found. Your library looks good."
+            )
+            self.fix_button.setEnabled(False)
+
+    def toggle_correct_files(self, state):
+        selected = self.current_finding()
+        selected_key = self.finding_key(selected) if selected else None
+        self.show_correct = bool(state)
+        self.populate(selected_key)
+
+    def current_finding(self):
+        rows = self.table.selectionModel().selectedRows()
+        if not rows:
+            return None
+        item = self.table.item(rows[0].row(), 0)
+        return item.data(Qt.ItemDataRole.UserRole) if item else None
+
+    def inspect_media_file(self, file_path):
+        """Inspect a duplicate locally. Uses ffprobe when available."""
+        path = Path(file_path)
+        info = {
+            "path": str(path),
+            "exists": path.exists(),
+            "size": path.stat().st_size if path.exists() else 0,
+            "width": None,
+            "height": None,
+            "codec": None,
+            "bitrate": None,
+            "duration": None,
+            "audio": [],
+            "hdr": False,
+            "probe_available": False,
+        }
+
+        ffprobe = shutil.which("ffprobe")
+        if not ffprobe or not path.exists():
+            return info
+
+        try:
+            result = subprocess.run(
+                [
+                    ffprobe,
+                    "-v", "error",
+                    "-show_entries",
+                    "format=duration,bit_rate:"
+                    "stream=index,codec_type,codec_name,width,height,bit_rate,"
+                    "channels,channel_layout,color_transfer,color_primaries,"
+                    "color_space",
+                    "-of", "json",
+                    str(path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if result.returncode != 0:
+                return info
+
+            data = json.loads(result.stdout or "{}")
+            info["probe_available"] = True
+            fmt = data.get("format") or {}
+
+            try:
+                info["duration"] = float(fmt.get("duration")) if fmt.get("duration") else None
+            except (TypeError, ValueError):
+                pass
+
+            try:
+                info["bitrate"] = int(fmt.get("bit_rate")) if fmt.get("bit_rate") else None
+            except (TypeError, ValueError):
+                pass
+
+            for stream in data.get("streams") or []:
+                if stream.get("codec_type") == "video" and info["width"] is None:
+                    info["width"] = stream.get("width")
+                    info["height"] = stream.get("height")
+                    info["codec"] = (stream.get("codec_name") or "").upper() or None
+
+                    transfer = (stream.get("color_transfer") or "").lower()
+                    primaries = (stream.get("color_primaries") or "").lower()
+                    info["hdr"] = (
+                        transfer in {"smpte2084", "arib-std-b67"}
+                        or "2020" in primaries
+                    )
+
+                    if not info["bitrate"]:
+                        try:
+                            info["bitrate"] = int(stream.get("bit_rate"))
+                        except (TypeError, ValueError):
+                            pass
+
+                elif stream.get("codec_type") == "audio":
+                    codec = (stream.get("codec_name") or "").upper()
+                    channels = stream.get("channels")
+                    layout = stream.get("channel_layout")
+                    label = codec or "Audio"
+                    if layout:
+                        label += f" {layout}"
+                    elif channels:
+                        label += f" {channels}ch"
+                    info["audio"].append(label)
+
+        except Exception:
+            pass
+
+        return info
+
+    def format_bytes(self, value):
+        if not value:
+            return "Unknown"
+        size = float(value)
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if size < 1024 or unit == "TB":
+                return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+            size /= 1024
+
+    def format_bitrate(self, value):
+        if not value:
+            return "Unknown"
+        return f"{value / 1_000_000:.1f} Mbps"
+
+    def duplicate_quality_score(self, info):
+        """Conservative quality ranking. Recommendation only."""
+        score = 0.0
+        pixels = (info.get("width") or 0) * (info.get("height") or 0)
+        score += pixels / 1_000_000 * 100
+
+        # Prefer efficient modern codecs slightly, but resolution/bitrate/size
+        # remain the dominant signals.
+        codec = (info.get("codec") or "").lower()
+        codec_bonus = {
+            "av1": 20,
+            "hevc": 15,
+            "h265": 15,
+            "vp9": 10,
+            "h264": 5,
+            "avc": 5,
+        }
+        score += codec_bonus.get(codec, 0)
+
+        if info.get("hdr"):
+            score += 20
+
+        bitrate = info.get("bitrate") or 0
+        score += min(bitrate / 1_000_000, 50)
+
+        audio = info.get("audio") or []
+        score += min(len(audio), 5) * 2
+
+        # Size is only a weak tiebreaker; larger does not automatically mean better.
+        size_gb = (info.get("size") or 0) / (1024 ** 3)
+        score += min(size_gb, 20) * 0.5
+        return score
+
+    def format_duplicate_details(self, finding):
+        message = finding.get("message", "")
+        episode_code = "Episode"
+        match = re.search(r"\bS\d{2}E\d{2}(?:-E\d{2})?\b", message, re.IGNORECASE)
+        if match:
+            episode_code = match.group(0).upper()
+
+        locations = []
+        if "multiple primary video files:" in message:
+            raw = message.split("multiple primary video files:", 1)[1].strip()
+            for item in raw.split(" | "):
+                item = item.strip()
+                if not item:
+                    continue
+                path = Path(item)
+                if not path.is_absolute():
+                    path = Path(self.root_path) / path
+                locations.append(str(path))
+
+        inspections = [self.inspect_media_file(location) for location in locations]
+
+        lines = [
+            f"DUPLICATE EPISODE — {episode_code}",
+            "",
+            f"Rogue found {len(locations) if locations else 'multiple'} video files "
+            "that appear to represent the same episode.",
+        ]
+
+        if inspections:
+            lines.extend(["", "COPIES"])
+            for number, info in enumerate(inspections, 1):
+                resolution = (
+                    f"{info['width']}x{info['height']}"
+                    if info.get("width") and info.get("height")
+                    else "Unknown resolution"
+                )
+                codec = info.get("codec") or "Unknown codec"
+                hdr = " • HDR" if info.get("hdr") else ""
+                audio = ", ".join(info.get("audio") or []) or "Unknown audio"
+
+                lines.extend([
+                    "",
+                    f"{number}. {info['path']}",
+                    f"   Video: {resolution} • {codec}{hdr}",
+                    f"   Bitrate: {self.format_bitrate(info.get('bitrate'))}",
+                    f"   Audio: {audio}",
+                    f"   Size: {self.format_bytes(info.get('size'))}",
+                ])
+
+        if inspections and any(item.get("probe_available") for item in inspections):
+            ranked = sorted(
+                enumerate(inspections, 1),
+                key=lambda pair: self.duplicate_quality_score(pair[1]),
+                reverse=True,
+            )
+            best_number, best = ranked[0]
+
+            lines.extend([
+                "",
+                "ROGUE RECOMMENDATION",
+                f"Copy {best_number} appears to be the best one to keep based on "
+                "resolution, codec, bitrate, HDR, audio tracks, and file size.",
+                "",
+                f"Recommended: {best['path']}",
+            ])
+
+            if len(ranked) > 1:
+                top_score = self.duplicate_quality_score(ranked[0][1])
+                second_score = self.duplicate_quality_score(ranked[1][1])
+                if abs(top_score - second_score) < 10:
+                    lines.extend([
+                        "",
+                        "The copies are technically very similar, so Rogue's "
+                        "recommendation is low confidence. Compare them manually "
+                        "before removing anything.",
+                    ])
+        else:
+            lines.extend([
+                "",
+                "ROGUE RECOMMENDATION",
+                "Detailed video inspection is unavailable because ffprobe was not "
+                "found. Rogue can still show file sizes, but cannot reliably "
+                "recommend which encode is better.",
+            ])
+
+        lines.extend([
+            "",
+            "SAFETY",
+            "Rogue will not automatically delete duplicate media. "
+            "The recommendation is informational only; you decide which copy to remove.",
+        ])
+        return "\n".join(lines)
+
+    def update_details(self):
+        finding = self.current_finding()
+        self.fix_button.setEnabled(False)
+
+        if not finding:
+            self.details.clear()
+            return
+
+        status, action = self.classify_finding(finding)
+        plan = self.fix_plans.get(self.finding_key(finding))
+        provider = get_active_provider_name()
+
+        if finding.get("category") == "Duplicate Episode":
+            self.details.setPlainText(self.format_duplicate_details(finding))
+            return
+
+        lines = [
+            f"STATUS: {status}",
+            f"ISSUE: {finding.get('category', 'Unknown')}",
+            f"FILE: {finding.get('path', '')}",
+            "",
+            finding.get("message", ""),
+        ]
+
+        if plan and plan.get("available"):
+            lines.extend([
+                "",
+                "ROGUE CAN FIX THIS SAFELY",
+                f"Metadata: {provider} • {plan.get('confidence') or 'High confidence'}",
+                "",
+                "CURRENT",
+                str(plan.get("current") or finding.get("path", "")),
+                "",
+                "ROGUE SUGGESTS",
+                str(plan.get("suggested") or ""),
+                "",
+                plan.get("reason") or "",
+            ])
+            self.fix_button.setEnabled(True)
+        elif status == "Missing":
+            lines.extend([
+                "",
+                "Rogue found a gap in the local episode sequence. "
+                "No file will be created, moved or deleted automatically.",
+            ])
+        elif status == "Correct":
+            lines.extend(["", "No action is needed."])
+        else:
+            lines.extend([
+                "",
+                "This needs review. Rogue will not make an automatic filesystem "
+                "decision for this item.",
+            ])
+
+        self.details.setPlainText("\n".join(lines))
+
+    def apply_selected_fix(self):
+        finding = self.current_finding()
         if not finding:
             return
 
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        QApplication.processEvents()
-        try:
-            plan=build_audit_fix_plan(
-                self.root_path,
-                finding,
-                self.verified_tv_matches,
-            )
-        finally:
-            QApplication.restoreOverrideCursor()
-
-        text=(
-            f"Status: {finding['severity']}\n"
-            f"Category: {finding['category']}\n"
-            f"File: {finding['path']}\n\n"
-            f"{finding['message']}"
-        )
-        if plan.get("available"):
-            self.current_fix_plan = plan
-            self.current_fix_finding = finding
-            self.apply_fix_button.setEnabled(True)
-            text+=(
-                "\n\nSUGGESTED FIX — READY TO APPLY\n"
-                f"Confidence: {plan['confidence']}\n"
-                f"Current: {plan['current']}\n"
-                f"Suggested: {plan['suggested']}\n\n"
-                f"Why: {plan['reason']}\n\n"
-                "Press Apply Selected Fix to preview the video and all attached "
-                "companions before anything changes."
-            )
-        else:
-            self.current_fix_plan = None
-            self.current_fix_finding = None
-            self.apply_fix_button.setEnabled(False)
-            text+=(
-                "\n\nSUGGESTED FIX\nNo automatic fix suggested.\n\n"
-                f"Reason: {plan.get('reason') or 'Rogue does not have a safe automatic suggestion for this finding.'}"
-                "\n\nNo files have been changed."
-            )
-        self.details.setPlainText(text)
-
-    def apply_selected_fix(self):
-        plan = self.current_fix_plan
-        finding = self.current_fix_finding
-
-        if not plan or not finding or not plan.get("available"):
+        key = self.finding_key(finding)
+        plan = self.fix_plans.get(key)
+        if not plan or not plan.get("available"):
             QMessageBox.information(
                 self,
-                "Apply Fix",
-                "Use Suggest Fix on a supported High-confidence finding first.",
+                "Fix Selected",
+                "This item does not have a safe automatic repair.",
             )
             return
 
@@ -2025,170 +2625,27 @@ class LibraryAuditDialog(QDialog):
         if not parent or not hasattr(parent, "apply_audit_fix"):
             QMessageBox.critical(
                 self,
-                "Apply Fix",
+                "Fix Selected",
                 "The main Rogue Renamer window is unavailable.",
             )
             return
 
-        result = parent.apply_audit_fix(plan, finding)
-        if not result:
+        if not parent.apply_audit_fix(plan, finding):
             return
 
-        # The filesystem changed, so refresh the local structural audit instead
-        # of leaving stale findings on screen.
-        self.findings = audit_library(self.root_path)
-        self.current_fix_plan = None
-        self.current_fix_finding = None
-        self.apply_fix_button.setEnabled(False)
+        # Re-run in the background so the UI remains responsive.
+        self.findings = []
+        self.verified_tv_matches = {}
+        self.fix_plans = {}
         self.populate()
+        self.start_background_check()
 
         QMessageBox.information(
             self,
-            "Audit Repair Complete",
+            "Library Repair Complete",
             "The selected repair was completed and added to Rename History. "
-            "It can be restored with Undo/History.",
+            "You can restore it with Undo/History.",
         )
-
-
-    def verify_with_tmdb(self):
-        # Preserve the currently selected audit finding across the TMDB refresh.
-        selected_key = None
-        selected_rows = self.table.selectionModel().selectedRows()
-        if selected_rows:
-            selected_item = self.table.item(selected_rows[0].row(), 0)
-            selected_finding = (
-                selected_item.data(Qt.ItemDataRole.UserRole)
-                if selected_item else None
-            )
-            if selected_finding:
-                selected_key = (
-                    selected_finding.get("path", "").casefold(),
-                    selected_finding.get("category", "").casefold(),
-                    selected_finding.get("message", "").casefold(),
-                )
-
-        self.tmdb_button.setEnabled(False)
-        self.tmdb_button.setText("Verifying…")
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        QApplication.processEvents()
-
-        online_categories = {
-            "TMDB Audit", "TMDB Match", "TMDB Season",
-            "Invalid Episode", "Missing Episode", "TMDB Verified",
-        }
-        self.findings = [
-            f for f in self.findings
-            if f.get("category") not in online_categories
-        ]
-        try:
-            add_tmdb_audit_findings(self.root_path, self.findings)
-            self.verified_tv_matches = collect_verified_tv_matches(self.root_path)
-        except Exception as error:
-            self.findings.append({
-                "severity":"Warning", "category":"TMDB Audit",
-                "path":self.root_path,
-                "message":f"TMDB verification stopped unexpectedly: {error}",
-            })
-        finally:
-            QApplication.restoreOverrideCursor()
-            self.tmdb_button.setEnabled(True)
-            self.tmdb_button.setText("Verify with TMDB")
-        self.populate(selection_key=selected_key)
-
-
-    def populate(self, _text=None, selection_key=None):
-        selected = self.filter_combo.currentText()
-        wanted = {
-            "Problems": "Problem",
-            "Warnings": "Warning",
-            "OK": "OK",
-        }.get(selected)
-
-        rows = [
-            finding
-            for finding in self.findings
-            if wanted is None or finding["severity"] == wanted
-        ]
-
-        problems = sum(f["severity"] == "Problem" for f in self.findings)
-        warnings = sum(f["severity"] == "Warning" for f in self.findings)
-        ok_count = sum(f["severity"] == "OK" for f in self.findings)
-        self.summary_label.setText(
-            f"{problems} Problems   •   {warnings} Warnings   •   {ok_count} OK"
-        )
-
-        self.table.setRowCount(0)
-        icons = {"Problem": "✖", "Warning": "⚠", "OK": "✓"}
-
-        for finding in rows:
-            row = self.table.rowCount()
-            self.table.insertRow(row)
-            values = [
-                f"{icons.get(finding['severity'], '')} {finding['severity']}",
-                finding["category"],
-                finding["path"],
-                finding["message"],
-            ]
-            for column, value in enumerate(values):
-                item = QTableWidgetItem(str(value))
-                item.setToolTip(str(value))
-                if column == 0:
-                    item.setData(Qt.ItemDataRole.UserRole, finding)
-                self.table.setItem(row, column, item)
-
-        if self.table.rowCount():
-            row_to_select = 0
-            if selection_key:
-                for row in range(self.table.rowCount()):
-                    item = self.table.item(row, 0)
-                    finding = item.data(Qt.ItemDataRole.UserRole) if item else None
-                    if not finding:
-                        continue
-                    row_key = (
-                        finding.get("path", "").casefold(),
-                        finding.get("category", "").casefold(),
-                        finding.get("message", "").casefold(),
-                    )
-                    if row_key == selection_key:
-                        row_to_select = row
-                        break
-
-            self.table.selectRow(row_to_select)
-            self.table.scrollToItem(
-                self.table.item(row_to_select, 0),
-                QTableWidget.ScrollHint.PositionAtCenter,
-            )
-        else:
-            self.details.clear()
-
-    def update_details(self):
-        self.current_fix_plan = None
-        self.current_fix_finding = None
-        self.apply_fix_button.setEnabled(False)
-
-        selected_rows = self.table.selectionModel().selectedRows()
-        if not selected_rows:
-            self.details.clear()
-            return
-
-        row = selected_rows[0].row()
-        item = self.table.item(row, 0)
-        if item is None:
-            self.details.clear()
-            return
-
-        finding = item.data(Qt.ItemDataRole.UserRole)
-        if not finding:
-            self.details.clear()
-            return
-
-        self.details.setPlainText(
-            f"Status: {finding['severity']}\n"
-            f"Category: {finding['category']}\n"
-            f"File: {finding['path']}\n\n"
-            f"{finding['message']}"
-        )
-
 
 
 class RogueRenamer(QMainWindow):
@@ -2316,7 +2773,62 @@ class RogueRenamer(QMainWindow):
             self.scan_subfolders_checkbox
         )
 
-        audit_button = QPushButton("Audit Library")
+        provider_label = QLabel("Metadata:")
+        controls.addWidget(provider_label)
+
+        self.provider_combo = QComboBox()
+
+        # Keep both the closed provider selector and its popup consistent
+        # with Rogue's dark theme. On Windows the popup view otherwise
+        # inherits the native light palette.
+        self.provider_combo.setStyleSheet("""
+            QComboBox {
+                background-color: #24292f;
+                color: #ffffff;
+                border: 1px solid #4a5057;
+                border-radius: 4px;
+                padding: 5px 28px 5px 8px;
+            }
+            QComboBox:hover {
+                border: 1px solid #6a727b;
+            }
+            QComboBox:focus {
+                border: 1px solid #7d8792;
+            }
+            QComboBox::drop-down {
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 24px;
+                border-left: 1px solid #4a5057;
+                background-color: #2b3036;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #24292f;
+                color: #ffffff;
+                border: 1px solid #4a5057;
+                selection-background-color: #3b4654;
+                selection-color: #ffffff;
+                outline: 0;
+            }
+        """)
+        self.provider_combo.setToolTip(
+            "Choose the metadata database Rogue Renamer will use. "
+            "Only the selected provider is queried."
+        )
+        for provider in available_providers():
+            self.provider_combo.addItem(provider["name"], provider["id"])
+
+        active_provider = get_active_provider_id()
+        active_index = self.provider_combo.findData(active_provider)
+        if active_index >= 0:
+            self.provider_combo.setCurrentIndex(active_index)
+
+        self.provider_combo.currentIndexChanged.connect(
+            self.metadata_provider_changed
+        )
+        controls.addWidget(self.provider_combo)
+
+        audit_button = QPushButton("Check Library")
         audit_button.setToolTip(
             "Scan an existing Movies or TV library for structural problems without changing files."
         )
@@ -2360,12 +2872,30 @@ class RogueRenamer(QMainWindow):
                 "Type",
                 "Parsed Title",
                 "S/E",
-                "TMDB Match",
+                "Metadata Match",
                 "Episode Title",
                 "Proposed Filename",
                 "Status",
             ]
         )
+
+        # Main file list: selecting any cell selects and highlights the full row.
+        self.table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self.table.setSelectionMode(
+            QTableWidget.SelectionMode.SingleSelection
+        )
+        self.table.setStyleSheet("""
+            QTableWidget {
+                selection-background-color: #3b4654;
+                selection-color: #ffffff;
+            }
+            QTableWidget::item:selected {
+                background-color: #3b4654;
+                color: #ffffff;
+            }
+        """)
 
         # Responsive table layout. Fixed-width utility columns stay compact,
         # while text-heavy columns share whatever width the window provides.
@@ -2843,6 +3373,23 @@ class RogueRenamer(QMainWindow):
         )
 
 
+    def metadata_provider_changed(self, _index):
+        provider_id = self.provider_combo.currentData()
+        if not provider_id:
+            return
+
+        try:
+            set_active_provider(provider_id)
+        except TMDBError as error:
+            QMessageBox.warning(self, "Metadata Provider", str(error))
+            return
+
+        provider_name = get_active_provider_name()
+        self.status_label.setText(
+            f"Metadata provider changed to {provider_name}. "
+            "Run Search Metadata to refresh matches."
+        )
+
     def open_library_audit(self):
         folder = QFileDialog.getExistingDirectory(
             self,
@@ -2851,13 +3398,9 @@ class RogueRenamer(QMainWindow):
         if not folder:
             return
 
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            findings = audit_library(folder)
-        finally:
-            QApplication.restoreOverrideCursor()
-
-        dialog = LibraryAuditDialog(folder, findings, self)
+        # Open immediately; LibraryAuditDialog performs the scan and metadata
+        # work on its background worker.
+        dialog = LibraryAuditDialog(folder, [], self)
         dialog.exec()
 
     def open_settings(self):
@@ -3504,48 +4047,46 @@ class RogueRenamer(QMainWindow):
         self.update_batch_summary()
         self.update_rename_state()
 
+    def row_is_safe_to_rename(self, row):
+        """Return True only for a row Rogue has already accepted/confirmed."""
+        match_item = self.table.item(row, 4)
+        proposed_item = self.table.item(row, 6)
+        status_item = self.table.item(row, 7)
+
+        if not match_item or not match_item.data(Qt.ItemDataRole.UserRole):
+            return False
+
+        if not proposed_item or not proposed_item.text().strip():
+            return False
+
+        status = status_item.text() if status_item else ""
+
+        blocked_markers = (
+            "Review",
+            "Low Match",
+            "No Match",
+            "Needs Review",
+            "Error:",
+            "Searching",
+            "Ready to Search",
+        )
+        if any(marker in status for marker in blocked_markers):
+            return False
+
+        return (
+            "Auto Accepted" in status
+            or "Manually Confirmed" in status
+            or "High Match" in status
+        )
+
     def update_rename_state(self):
-        """Enable Rename only when every loaded row is safe to rename."""
-        count = self.table.rowCount()
+        """Enable Rename whenever at least one loaded row is safe to rename."""
+        has_safe_row = any(
+            self.row_is_safe_to_rename(row)
+            for row in range(self.table.rowCount())
+        )
+        self.rename_button.setEnabled(has_safe_row)
 
-        if count == 0:
-            self.rename_button.setEnabled(False)
-            return
-
-        for row in range(count):
-            match_item = self.table.item(row, 4)
-            proposed_item = self.table.item(row, 6)
-            status_item = self.table.item(row, 7)
-
-            if not match_item or not match_item.data(
-                Qt.ItemDataRole.UserRole
-            ):
-                self.rename_button.setEnabled(False)
-                return
-
-            if not proposed_item or not proposed_item.text().strip():
-                self.rename_button.setEnabled(False)
-                return
-
-            status = (
-                status_item.text()
-                if status_item
-                else ""
-            )
-
-            if (
-                "Review" in status
-                or "Low Match" in status
-                or "No Match" in status
-                or "Needs Review" in status
-                or "Error:" in status
-                or "Searching" in status
-                or "Ready to Search" in status
-            ):
-                self.rename_button.setEnabled(False)
-                return
-
-        self.rename_button.setEnabled(True)
 
     def build_audit_repair_plan(self, fix_plan):
         """Build a validated video+companion plan for one approved audit repair."""
@@ -3722,34 +4263,32 @@ class RogueRenamer(QMainWindow):
 
 
     def build_rename_plan(self):
-        """Validate video and companion destinations before changing files."""
-        plan = []
-        destinations = set()
-        errors = []
+        """Build a safe rename plan and isolate conflicting rows."""
+        row_batches = []
+        hard_errors = []
 
         for row in range(self.table.rowCount()):
+            if not self.row_is_safe_to_rename(row):
+                continue
+
             original_item = self.table.item(row, 0)
             proposed_item = self.table.item(row, 6)
             match_item = self.table.item(row, 4)
 
             if not original_item or not proposed_item or not match_item:
-                errors.append(
+                hard_errors.append(
                     f"Row {row + 1}: missing rename information."
                 )
                 continue
 
             source = Path(
-                original_item.data(
-                    Qt.ItemDataRole.UserRole
-                )
+                original_item.data(Qt.ItemDataRole.UserRole)
             )
             proposed_name = proposed_item.text().strip()
-            match = match_item.data(
-                Qt.ItemDataRole.UserRole
-            )
+            match = match_item.data(Qt.ItemDataRole.UserRole)
 
             if not proposed_name or not match:
-                errors.append(
+                hard_errors.append(
                     f"{source.name}: missing proposed filename or match."
                 )
                 continue
@@ -3761,75 +4300,102 @@ class RogueRenamer(QMainWindow):
                     proposed_name,
                 )
             except ValueError as error:
-                errors.append(
-                    f"{source.name}: {error}"
-                )
+                hard_errors.append(f"{source.name}: {error}")
                 continue
 
-            batch_items = [
-                {
-                    "row": row,
-                    "source": source,
-                    "destination": destination,
-                    "kind": "video",
-                }
-            ]
+            items = [{
+                "row": row,
+                "source": source,
+                "destination": destination,
+                "kind": "video",
+            }]
 
             for companion in find_companion_files(source):
-                companion_destination = build_companion_destination(
-                    destination,
-                    companion,
-                )
-                batch_items.append(
-                    {
-                        "row": row,
-                        "source": companion,
-                        "destination": companion_destination,
-                        "kind": "companion",
-                    }
-                )
+                items.append({
+                    "row": row,
+                    "source": companion,
+                    "destination": build_companion_destination(
+                        destination,
+                        companion,
+                    ),
+                    "kind": "companion",
+                })
 
-            for item in batch_items:
-                item_source = item["source"]
-                item_destination = item["destination"]
+            row_batches.append({
+                "row": row,
+                "video_source": source,
+                "video_destination": destination,
+                "items": items,
+            })
 
-                source_key = str(
-                    item_source.absolute()
-                ).casefold()
-                destination_key = str(
-                    item_destination.absolute()
-                ).casefold()
+        # Map every proposed destination to the rows that want it.
+        destination_rows = {}
+        for batch in row_batches:
+            for item in batch["items"]:
+                key = str(item["destination"].absolute()).casefold()
+                destination_rows.setdefault(key, set()).add(batch["row"])
 
-                if destination_key in destinations:
-                    errors.append(
-                        f"Duplicate destination: {item_destination}"
+        conflicting_rows = set()
+        for rows in destination_rows.values():
+            if len(rows) > 1:
+                conflicting_rows.update(rows)
+
+        safe_plan = []
+        skipped_conflicts = []
+
+        for batch in row_batches:
+            row = batch["row"]
+
+            if row in conflicting_rows:
+                skipped_conflicts.append({
+                    "row": row,
+                    "source": batch["video_source"],
+                    "destination": batch["video_destination"],
+                    "reason": "duplicate destination",
+                })
+                continue
+
+            batch_has_error = False
+            batch_plan = []
+
+            for item in batch["items"]:
+                source = item["source"]
+                destination = item["destination"]
+
+                source_key = str(source.absolute()).casefold()
+                destination_key = str(destination.absolute()).casefold()
+
+                if not source.exists():
+                    hard_errors.append(
+                        f"Source file is missing: {source}"
                     )
-                    continue
+                    batch_has_error = True
+                    break
 
-                destinations.add(destination_key)
-
-                if not item_source.exists():
-                    errors.append(
-                        f"Source file is missing: {item_source}"
-                    )
-                    continue
-
+                # Already at its intended location: nothing to do for this item.
                 if source_key == destination_key:
                     continue
 
-                if item_destination.exists():
-                    errors.append(
-                        f"Destination already exists: {item_destination}"
+                if destination.exists():
+                    hard_errors.append(
+                        f"Destination already exists: {destination}"
                     )
-                    continue
+                    batch_has_error = True
+                    break
 
-                plan.append(item)
+                batch_plan.append(item)
 
-        return plan, errors
+            if not batch_has_error:
+                safe_plan.extend(batch_plan)
+
+        return safe_plan, hard_errors, skipped_conflicts
 
     def rename_files(self):
-        plan, errors = self.build_rename_plan()
+        plan, errors, skipped_conflicts = self.build_rename_plan()
 
+        # Missing sources / existing destination files remain hard blockers.
+        # Duplicate destinations within THIS batch are different: Rogue can
+        # safely omit every conflicting row and continue with unrelated files.
         if errors:
             QMessageBox.critical(
                 self,
@@ -3842,6 +4408,62 @@ class RogueRenamer(QMainWindow):
                     if len(errors) > 12
                     else ""
                 ),
+            )
+            return
+
+        if skipped_conflicts and plan:
+            unique_destinations = []
+            seen = set()
+            for conflict in skipped_conflicts:
+                key = str(conflict["destination"]).casefold()
+                if key not in seen:
+                    seen.add(key)
+                    unique_destinations.append(conflict["destination"])
+
+            safe_rows = len({
+                item["row"]
+                for item in plan
+                if item.get("kind") == "video"
+            })
+
+            conflict_lines = "\n".join(
+                f"• {destination}"
+                for destination in unique_destinations[:6]
+            )
+            if len(unique_destinations) > 6:
+                conflict_lines += (
+                    f"\n• ...and {len(unique_destinations) - 6} more"
+                )
+
+            message = (
+                f"Rogue found {len(skipped_conflicts)} accepted file(s) "
+                "that conflict because they would use the same destination.\n\n"
+                "Rogue will NOT choose between or delete duplicate media. "
+                "Every conflicting copy will be left untouched.\n\n"
+                f"Conflicting destination(s):\n{conflict_lines}\n\n"
+                f"{safe_rows} other video file(s) are safe to rename.\n\n"
+                "Continue with only the safe files?"
+            )
+
+            choice = QMessageBox.question(
+                self,
+                "Duplicate Destinations",
+                message,
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Yes,
+            )
+            if choice != QMessageBox.StandardButton.Yes:
+                return
+
+        elif skipped_conflicts and not plan:
+            QMessageBox.warning(
+                self,
+                "Duplicates Need Review",
+                "All accepted files in this batch conflict with another "
+                "file that would use the same destination.\n\n"
+                "Rogue did not rename or delete anything. Review the "
+                "duplicates and choose which copy you want to keep.",
             )
             return
 
@@ -4081,3 +4703,6 @@ def main():
     sys.exit(
         app.exec()
     )
+
+if __name__ == "__main__":
+    main()
