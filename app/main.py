@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
 
 import requests
 
-from app.metadata import tvdb, omdb
+from app.metadata import tvdb, omdb, anilist
 
 from app.metadata.providers import (
     MetadataProviderError as TMDBError,
@@ -513,6 +513,29 @@ class SettingsDialog(QDialog):
         omdb_test_button.clicked.connect(self.test_omdb_connection)
         layout.addWidget(omdb_test_button)
 
+        anilist_title = QLabel("AniList")
+        anilist_title.setStyleSheet(
+            "font-size: 18px; font-weight: bold; margin-top: 12px;"
+        )
+        layout.addWidget(anilist_title)
+
+        anilist_help = QLabel(
+            "AniList provides public anime metadata without an API key. "
+            "Rogue uses it only when AniList is selected as the metadata provider. "
+            "AniList does not provide per-episode titles, so anime episodes use "
+            "generic Episode 1 / Episode 2 titles."
+        )
+        anilist_help.setWordWrap(True)
+        anilist_help.setStyleSheet("color: #aaaaaa;")
+        layout.addWidget(anilist_help)
+
+        self.anilist_connection_status = QLabel("AniList connection not tested")
+        layout.addWidget(self.anilist_connection_status)
+
+        anilist_test_button = QPushButton("Test AniList Connection")
+        anilist_test_button.clicked.connect(self.test_anilist_connection)
+        layout.addWidget(anilist_test_button)
+
         naming_title = QLabel("Naming Presets")
         naming_title.setStyleSheet(
             "font-size: 20px; font-weight: bold; margin-top: 12px;"
@@ -818,6 +841,15 @@ class SettingsDialog(QDialog):
         finally:
             self.config["omdb"] = old_omdb
             save_config(self.config)
+
+    def test_anilist_connection(self):
+        try:
+            anilist.test_connection()
+            self.anilist_connection_status.setText(
+                "✓ Connected to AniList successfully"
+            )
+        except anilist.AniListError as error:
+            self.anilist_connection_status.setText(f"❌ {error}")
 
     def save_settings(self):
         self.config["tmdb"] = {
@@ -2223,6 +2255,28 @@ class LibraryAuditDialog(QDialog):
         )
         layout.addWidget(self.details, 2)
 
+        self.ffmpeg_notice = QLabel()
+        self.ffmpeg_notice.setWordWrap(True)
+        self.ffmpeg_notice.setTextFormat(Qt.TextFormat.RichText)
+        self.ffmpeg_notice.setOpenExternalLinks(True)
+        self.ffmpeg_notice.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextBrowserInteraction
+        )
+        self.ffmpeg_notice.setStyleSheet(
+            "QLabel { background:#20252a; color:#ddd; border:1px solid #555; "
+            "padding:8px; } "
+            "QLabel a { color:#9fd3ff; text-decoration:underline; font-weight:bold; }"
+        )
+        self.ffmpeg_notice.setText(
+            "<b>Better duplicate inspection with FFmpeg</b><br>"
+            "Install <a href='https://ffmpeg.org/download.html'>FFmpeg</a> "
+            "to let Rogue compare resolution, codec, bitrate, HDR, audio tracks, "
+            "and other technical details so it can recommend which duplicate "
+            "appears better to keep. Rogue never automatically deletes duplicate media."
+        )
+        self.ffmpeg_notice.hide()
+        layout.addWidget(self.ffmpeg_notice)
+
         self.worker_thread = None
         self.worker = None
 
@@ -2593,7 +2647,8 @@ class LibraryAuditDialog(QDialog):
                 "ROGUE RECOMMENDATION",
                 "Detailed video inspection is unavailable because ffprobe was not "
                 "found. Rogue can still show file sizes, but cannot reliably "
-                "recommend which encode is better.",
+                "recommend which encode is better. Use the FFmpeg installation "
+                "link below to enable technical comparison.",
             ])
 
         lines.extend([
@@ -2607,6 +2662,7 @@ class LibraryAuditDialog(QDialog):
     def update_details(self):
         finding = self.current_finding()
         self.fix_button.setEnabled(False)
+        self.ffmpeg_notice.hide()
 
         if not finding:
             self.details.clear()
@@ -2618,6 +2674,7 @@ class LibraryAuditDialog(QDialog):
 
         if finding.get("category") == "Duplicate Episode":
             self.details.setPlainText(self.format_duplicate_details(finding))
+            self.ffmpeg_notice.setVisible(shutil.which("ffprobe") is None)
             return
 
         lines = [

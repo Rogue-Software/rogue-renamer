@@ -1,4 +1,4 @@
-from app.metadata import tmdb, tvdb, omdb
+from app.metadata import tmdb, tvdb, omdb, anilist
 from app.settings import load_config, save_config
 
 
@@ -18,6 +18,10 @@ PROVIDERS = {
     "omdb": {
         "id": "omdb",
         "name": "OMDb",
+    },
+    "anilist": {
+        "id": "anilist",
+        "name": "AniList",
     },
 }
 
@@ -62,7 +66,14 @@ def _call(function_name, *args, **kwargs):
             return getattr(tvdb, function_name)(*args, **kwargs)
         if provider_id == "omdb":
             return getattr(omdb, function_name)(*args, **kwargs)
-    except (tmdb.TMDBError, tvdb.TVDBError, omdb.OMDbError) as error:
+        if provider_id == "anilist":
+            return getattr(anilist, function_name)(*args, **kwargs)
+    except (
+        tmdb.TMDBError,
+        tvdb.TVDBError,
+        omdb.OMDbError,
+        anilist.AniListError,
+    ) as error:
         raise MetadataProviderError(str(error)) from error
 
     raise MetadataProviderError(
